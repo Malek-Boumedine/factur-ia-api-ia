@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     APP_NAME: str = "factur-ia-api-ia"
     ENVIRONNEMENT: str = "dev"
     DEBUG: bool = False
-    API_HOST: str = "0.0.0.0"  # noqa: S104
+    API_HOST: str = "0.0.0.0"  # noqa: S104  # nosec B104
     API_PORT: int = 8090
 
     # --- Sécurité (token partagé avec l'API data pour le callback OCR) ---
