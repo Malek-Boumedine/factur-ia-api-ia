@@ -56,4 +56,4 @@ class Settings(BaseSettings):
         return [lang.strip() for lang in self.OCR_LANGUAGES.split(",") if lang.strip()]
 
 
-settings = Settings()  # type: ignore[call-arg]
+settings = Settings()
