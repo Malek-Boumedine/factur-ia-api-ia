@@ -1,0 +1,47 @@
+name: Semantic Release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  packages: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    # On ne release que si le push vient bien de la branche main
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Nécessaire pour analyser l'historique des commits
+          token: ${{ secrets.FIL_ROUGE_RELEASE_TOKEN }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          python-version: '3.13'
+
+      - name: Install dependencies
+        run: uv sync --all-groups
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "github-actions [bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Python Semantic Release
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.FIL_ROUGE_RELEASE_TOKEN }}
+        run: |
+          uv run semantic-release version
+          uv run semantic-release publish

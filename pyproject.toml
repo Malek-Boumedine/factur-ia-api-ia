@@ -1,0 +1,85 @@
+[project]
+name = "factur-ia-api-ia"
+version = "0.1.0"
+description = "Microservice IA d'extraction de factures (OCR + LLM) pour le système Factur-IA"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "python-multipart>=0.0.20",
+    "pydantic>=2.10",
+    "pydantic-settings>=2.7",
+    "httpx>=0.28",
+    "loguru>=0.7",
+    "pdfplumber>=0.11",
+    "easyocr>=1.7",
+    "groq>=0.15",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15",
+    "mypy>=1.20",
+    "bandit>=1.8",
+    "detect-secrets>=1.5",
+    "pre-commit>=4.0",
+    "python-semantic-release>=9.15",
+]
+test = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=6.0",
+    "python-dotenv>=1.0",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py313"
+src = ["src"]
+
+[tool.ruff.lint]
+# E/F pycodestyle+pyflakes, I isort, B bugbear, UP pyupgrade, S flake8-bandit
+select = ["E", "F", "I", "B", "UP", "S"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]                          # asserts autorisés dans les tests
+"src/extractions/prompts.py" = ["E501"]       # texte de prompt, non contraint par la longueur
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = [
+    "fastapi.Depends",
+    "fastapi.File",
+    "fastapi.Form",
+    "fastapi.Query",
+    "fastapi.Security",
+    "fastapi.Header",
+    "fastapi.Path",
+    "fastapi.Body",
+]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+ignore_missing_imports = true
+plugins = ["pydantic.mypy"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["src"]
+
+[tool.semantic_release]
+version_toml = ["pyproject.toml:project.version"]
+branch = "main"
+upload_to_repository = false
+upload_to_release = true
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
