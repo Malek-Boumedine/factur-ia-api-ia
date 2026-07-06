@@ -21,9 +21,33 @@ ressort de la tâche validation/score suivante, pas de ce module.
 Contraintes du mode ``strict: true`` (Groq) respectées par le schéma : tous les
 champs listés dans ``required``, ``additionalProperties: false`` sur chaque objet,
 et champs optionnels exprimés par une union avec ``null`` (``["string", "null"]``).
+
+Le schéma effectivement envoyé au LLM (``INVOICE_JSON_SCHEMA``) ajoute au miroir du
+contrat un champ ``type_document`` (suggestion de classification devis/facture/avoir/
+inconnu). Ce champ n'appartient PAS à ``OcrWebhookPayload`` : il est ajouté à plat
+au schéma pour être produit dans le même appel LLM, puis séparé du sous-ensemble
+contrat côté ``structurer.py``. Le miroir pur du contrat reste ``_INVOICE_SCHEMA``.
 """
 
+from enum import StrEnum
 from typing import Any
+
+
+class TypeDocument(StrEnum):
+    """Nature du document détectée par l'IA — suggestion non contraignante.
+
+    La décision finale revient à l'humain (validation human-in-the-loop côté API
+    data / front). Ce type ne fait PAS partie du contrat ``OcrWebhookPayload`` : il
+    n'est pas transmis au callback, il reste dans la sortie interne de
+    structuration. Source unique des valeurs autorisées du champ ``type_document``
+    du schéma LLM.
+    """
+
+    DEVIS = "devis"
+    FACTURE = "facture"
+    AVOIR = "avoir"
+    INCONNU = "inconnu"  # type indéterminable : valeur par défaut
+
 
 # Prompt système : consignes d'extraction. En français (destiné au modèle), il
 # insiste sur les points sensibles constatés (taux TVA confondu avec un id,
@@ -52,6 +76,12 @@ Règles impératives :
   `quantite` vaut `1` si elle n'est pas précisée. S'il n'y a aucune ligne
   identifiable, renvoie une liste vide.
 - `iban` : l'IBAN de paiement s'il figure sur la facture, sinon `null`.
+- `type_document` : classe la nature du document parmi `facture`, `devis`, `avoir`
+  ou `inconnu`. Indices : un `devis` propose un prix avant commande (« devis »,
+  « proposition commerciale », pas de paiement dû) ; un `avoir` est une note de
+  crédit / remboursement (« avoir », « note de crédit », montants négatifs) ; une
+  `facture` réclame un paiement (« facture », « à payer »). Si aucun indice fiable,
+  mets `inconnu` — ne devine pas. Ce champ est une simple suggestion.
 
 Réponds seulement avec le JSON."""
 
@@ -103,12 +133,31 @@ _INVOICE_SCHEMA: dict[str, Any] = {
     ],
 }
 
+# Schéma effectivement envoyé au LLM : miroir du contrat (``_INVOICE_SCHEMA``)
+# augmenté, à plat, du champ ``type_document`` (suggestion de classification hors
+# contrat). Un schéma plat est plus fiable pour le modèle qu'une imbrication ; la
+# séparation type_document / sous-ensemble contrat est faite côté ``structurer.py``
+# après réception. ``enum`` sur une chaîne est supporté en mode strict et garantit
+# une des valeurs de ``TypeDocument`` (source unique des valeurs autorisées).
+_STRUCTURATION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        **_INVOICE_SCHEMA["properties"],
+        "type_document": {
+            "type": "string",
+            "enum": [type_doc.value for type_doc in TypeDocument],
+        },
+    },
+    "required": [*_INVOICE_SCHEMA["required"], "type_document"],
+}
+
 # ``response_format`` complet à passer à ``call_llm`` (structured outputs strict).
 INVOICE_JSON_SCHEMA: dict[str, Any] = {
     "type": "json_schema",
     "json_schema": {
         "name": _SCHEMA_NAME,
         "strict": True,
-        "schema": _INVOICE_SCHEMA,
+        "schema": _STRUCTURATION_SCHEMA,
     },
 }
