@@ -15,6 +15,7 @@ dependencies = [
     "pdfplumber>=0.11",
     "easyocr>=1.7",
     "groq>=0.15",
+    "pymupdf>=1.28.0",
 ]
 
 [dependency-groups]
@@ -31,6 +32,7 @@ test = [
     "pytest-asyncio>=0.24",
     "pytest-cov>=6.0",
     "python-dotenv>=1.0",
+    "reportlab>=4.2",  # génération de PDF factices pour les tests de détection
 ]
 
 [tool.ruff]
