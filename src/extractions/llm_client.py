@@ -60,18 +60,30 @@ def _get_client() -> Any:  # le SDK groq n'expose pas de stubs typés
     return _client
 
 
-def call_llm(system_prompt: str, user_content: str) -> str:
+def call_llm(
+    system_prompt: str,
+    user_content: str,
+    *,
+    response_format: dict[str, Any] | None = None,
+) -> str:
     """Soumet un prompt système + un contenu utilisateur au modèle Groq.
 
     Appel non-streamé (``stream=False`` : réponse complète d'un coup) et
     déterministe (``temperature=0``, adapté à l'extraction). Le modèle
-    (``GROQ_MODEL``) et le timeout viennent de la configuration. Aucun format de
-    réponse n'est imposé : la fonction renvoie le texte brut du modèle, à charger
-    de structurer/parser en aval.
+    (``GROQ_MODEL``) et le timeout viennent de la configuration.
+
+    Par défaut, aucun format de réponse n'est imposé : la fonction renvoie le
+    texte brut du modèle. Un ``response_format`` (ex. structured outputs
+    ``json_schema`` strict, supporté par ``openai/gpt-oss-120b``) peut être fourni
+    pour contraindre la structure de la réponse ; le client reste générique et ne
+    connaît pas le schéma métier (défini par l'appelant).
 
     Args:
         system_prompt: instruction système (rôle, consignes) donnée au modèle.
         user_content: contenu utilisateur soumis (ici, le texte brut extrait).
+        response_format: dict ``response_format`` transmis tel quel au SDK Groq
+            (ex. ``{"type": "json_schema", "json_schema": {...}}``). Omis si
+            ``None`` (appel générique sans contrainte de format).
 
     Returns:
         Le contenu textuel brut de la réponse du modèle (chaîne vide si le modèle
@@ -82,16 +94,20 @@ def call_llm(system_prompt: str, user_content: str) -> str:
             limit, erreur API) → extraction inexploitable, ``score_confiance = 0``
             côté API data.
     """
+    kwargs: dict[str, Any] = {
+        "model": settings.GROQ_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
+        "temperature": _TEMPERATURE,
+        "stream": False,
+    }
+    if response_format is not None:
+        kwargs["response_format"] = response_format
+
     try:
-        response = _get_client().chat.completions.create(
-            model=settings.GROQ_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content},
-            ],
-            temperature=_TEMPERATURE,
-            stream=False,
-        )
+        response = _get_client().chat.completions.create(**kwargs)
         return response.choices[0].message.content or ""
     except Exception as exc:  # SDK Groq : APIError, timeout, rate limit, réseau...
         raise LlmClientError(

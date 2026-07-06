@@ -89,6 +89,31 @@ def test_call_llm_passes_config_and_flags(monkeypatch: pytest.MonkeyPatch) -> No
     ]
 
 
+def test_call_llm_omits_response_format_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Sans response_format, la clé ne doit pas être envoyée au SDK (appel générique).
+    completions = _FakeCompletions()
+    monkeypatch.setattr(llm_client, "_get_client", lambda: _FakeClient(completions))
+
+    call_llm("système", "contenu")
+
+    (kwargs,) = completions.calls
+    assert "response_format" not in kwargs
+
+
+def test_call_llm_forwards_response_format(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Un response_format fourni est transmis tel quel au SDK (structured outputs).
+    completions = _FakeCompletions()
+    monkeypatch.setattr(llm_client, "_get_client", lambda: _FakeClient(completions))
+    fmt = {"type": "json_schema", "json_schema": {"name": "x", "strict": True}}
+
+    call_llm("système", "contenu", response_format=fmt)
+
+    (kwargs,) = completions.calls
+    assert kwargs["response_format"] is fmt
+
+
 def test_call_llm_empty_content_returns_empty_string(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
