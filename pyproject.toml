@@ -1,6 +1,6 @@
 [project]
 name = "factur-ia-api-ia"
-version = "1.0.0"
+version = "1.1.0"
 description = "Microservice IA d'extraction de factures (OCR + LLM) pour le système Factur-IA"
 readme = "README.md"
 requires-python = ">=3.13"
