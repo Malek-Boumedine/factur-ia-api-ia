@@ -4,7 +4,7 @@ Câble les briques déjà écrites et testées en un seul enchaînement, exécut
 tâche de fond (``fastapi.BackgroundTasks``) après le ``202`` de l'endpoint :
 
     routage extraction → texte brut → structuration LLM → score de confiance
-    → validation contrat → ``OcrWebhookPayload``
+    → validation contrat → ``OcrWebhookPayload`` → envoi au callback OCR
 
 Le module est **synchrone** à dessein : les briques lourdes (``pdfplumber``,
 EasyOCR, client Groq) sont bloquantes. Lancé via ``BackgroundTasks``, il tourne
@@ -21,12 +21,16 @@ Routage d'extraction (l'orchestrateur connaît le ``content_type``) :
 Gestion d'erreurs volontairement **minimale** ici : toutes les briques exposent
 le même contrat d'échec (« extraction inexploitable → ``score_confiance = 0`` »),
 donc un unique ``try/except`` englobant les traduit en payload d'échec via
-``build_failure_payload``. La gestion fine de bout en bout (timeouts, causes
-distinctes, échec du POST callback, retries) est une tâche ultérieure.
+``build_failure_payload``. Le payload — succès **ou** échec — est ensuite POSTé
+au callback OCR de l'API data (retries gérés par ``callback.client``) ; un envoi
+définitivement échoué est seulement journalisé, le payload est perdu (limite
+assumée du choix ``BackgroundTasks``, cf. CLAUDE.md). La gestion fine des causes
+distinctes (timeouts par brique, etc.) reste une tâche ultérieure.
 """
 
 import logging
 
+from src.callback.client import CallbackError, send_callback
 from src.callback.schemas import OcrWebhookPayload
 from src.extractions.confidence import compute_confidence
 from src.extractions.llm_client import LlmClientError
@@ -95,15 +99,21 @@ def run_extraction_pipeline(
     id_document: int,
     content_type: str,
 ) -> OcrWebhookPayload:
-    """Exécute le pipeline complet et construit le payload contrat à transmettre.
+    """Exécute le pipeline complet et transmet le payload contrat au callback.
 
     Enchaîne extraction du texte, structuration LLM, calcul du score de confiance
     et validation contre ``OcrWebhookPayload``. En cas d'échec d'une brique
     (document illisible, appel LLM en erreur, JSON inexploitable, validation
-    contrat impossible), renvoie le payload d'échec canonique
+    contrat impossible), produit le payload d'échec canonique
     (``score_confiance = 0``) plutôt que de propager l'exception : la tâche de
     fond ne doit jamais planter silencieusement, l'API data doit recevoir un
     verdict d'échec exploitable.
+
+    Le payload — succès **ou** échec — est ensuite POSTé au callback OCR de
+    l'API data (c'est le payload d'échec qui fait passer le document en
+    « erreur » côté data). Un envoi définitivement échoué (``CallbackError``)
+    est journalisé puis avalé : le payload est perdu, limite assumée du choix
+    ``BackgroundTasks`` (cf. CLAUDE.md).
 
     Args:
         content: contenu binaire du fichier reçu (lu avant le ``202`` dans le
@@ -112,7 +122,7 @@ def run_extraction_pipeline(
         content_type: type MIME validé en amont (PDF, JPEG ou PNG).
 
     Returns:
-        Un ``OcrWebhookPayload`` prêt à envoyer : soit l'extraction validée
+        L'``OcrWebhookPayload`` envoyé au callback : soit l'extraction validée
         (``score_confiance > 0``), soit le payload d'échec (``score_confiance = 0``).
     """
     try:
@@ -130,6 +140,11 @@ def run_extraction_pipeline(
         facture = structured["facture"]
         confidence = compute_confidence(facture)
         payload = validate_extraction(id_document, facture, confidence.score_global)
+        logger.info(
+            "Document %s — extraction réussie (score de confiance : %s).",
+            id_document,
+            payload.score_confiance,
+        )
     except _EXTRACTION_FAILURES:
         # Contrat d'échec commun aux briques : extraction inexploitable → payload
         # à ``score_confiance = 0``. Gestion fine (causes, timeouts) : tâche d'après.
@@ -138,15 +153,20 @@ def run_extraction_pipeline(
             id_document,
             exc_info=True,
         )
-        return build_failure_payload(id_document)
+        payload = build_failure_payload(id_document)
 
-    logger.info(
-        "Document %s — extraction réussie (score de confiance : %s).",
-        id_document,
-        payload.score_confiance,
-    )
+    # Envoi au callback dans TOUS les cas : le payload d'échec doit remonter à
+    # l'API data pour passer le document en « erreur ». Un échec définitif de
+    # l'envoi est seulement journalisé : personne n'attend la tâche de fond et
+    # il n'y a pas de file de rejeu — le payload est perdu (limite assumée du
+    # choix BackgroundTasks, cf. CLAUDE.md).
+    try:
+        send_callback(payload)
+    except CallbackError:
+        logger.error(
+            "Document %s — envoi au callback définitivement échoué, payload perdu.",
+            id_document,
+            exc_info=True,
+        )
 
-    # TODO(callback): POST du payload vers le webhook OCR de l'API data
-    # (callback.client -> settings.ocr_callback_url, header X-OCR-Secret-Token).
-    # Tâche suivante. Pour l'instant le payload est construit puis renvoyé.
     return payload

@@ -1,9 +1,11 @@
 """Tests de l'orchestrateur du pipeline (``run_extraction_pipeline``).
 
 Les briques lourdes (OCR EasyOCR, LLM Groq, ouverture PDF ``pdfplumber``) sont
-mockées : aucun appel réseau, aucun vrai OCR. On teste le *câblage* — routage des
-trois chemins (image, PDF natif, PDF scanné), enchaînement des étapes, forme du
-payload final, chemin d'échec — pas le comportement des briques elles-mêmes.
+mockées : aucun appel réseau, aucun vrai OCR. L'envoi au callback OCR
+(``send_callback``) est mocké par une fixture autouse qui capture les payloads
+envoyés — aucun POST réel. On teste le *câblage* — routage des trois chemins
+(image, PDF natif, PDF scanné), enchaînement des étapes, forme du payload final,
+chemin d'échec, envoi au callback — pas le comportement des briques elles-mêmes.
 
 ``compute_confidence`` et ``validate_extraction`` (purs, déterministes, sans
 réseau) restent réels : le payload produit est donc validé de bout en bout contre
@@ -14,6 +16,8 @@ from decimal import Decimal
 from typing import Any
 
 import pytest
+from src.callback.client import CallbackError
+from src.callback.schemas import OcrWebhookPayload
 from src.extractions import service
 from src.extractions.ocr_extractor import OcrExtractionError
 from src.extractions.pdf_detector import PdfType
@@ -44,6 +48,19 @@ def _facture() -> dict[str, Any]:
             }
         ],
     }
+
+
+@pytest.fixture(autouse=True)
+def sent_payloads(monkeypatch: pytest.MonkeyPatch) -> list[OcrWebhookPayload]:
+    """Mocke l'envoi au callback OCR : aucun POST réel, capture les payloads.
+
+    Autouse : sans elle, chaque test du pipeline tenterait un vrai POST vers
+    ``settings.ocr_callback_url``. Les tests qui veulent vérifier l'envoi
+    demandent la fixture et inspectent la liste des payloads capturés.
+    """
+    sent: list[OcrWebhookPayload] = []
+    monkeypatch.setattr(service, "send_callback", sent.append)
+    return sent
 
 
 @pytest.fixture
@@ -160,3 +177,57 @@ def test_extraction_failure_yields_failure_payload(
     assert payload.score_confiance == Decimal("0")  # marqueur unique d'échec
     assert payload.total_ht == Decimal("0")
     assert payload.lignes == []
+
+
+def test_success_payload_is_sent_to_callback(
+    monkeypatch: pytest.MonkeyPatch,
+    mock_structure: None,
+    sent_payloads: list[OcrWebhookPayload],
+) -> None:
+    """Le payload de succès est envoyé au callback (le même que celui retourné)."""
+    monkeypatch.setattr(service, "extract_ocr_text", lambda content, *, is_pdf: "txt")
+
+    payload = run_extraction_pipeline(b"image", 42, _PNG_MIME)
+
+    assert sent_payloads == [payload]
+    assert sent_payloads[0].score_confiance > 0
+
+
+def test_failure_payload_is_also_sent_to_callback(
+    monkeypatch: pytest.MonkeyPatch,
+    sent_payloads: list[OcrWebhookPayload],
+) -> None:
+    """Le payload d'échec part AUSSI au callback : c'est ainsi que l'API data
+    apprend l'échec et passe le document en « erreur »."""
+
+    def _raise(content: bytes, *, is_pdf: bool) -> str:
+        raise OcrExtractionError("image illisible")
+
+    monkeypatch.setattr(service, "extract_ocr_text", _raise)
+
+    payload = run_extraction_pipeline(b"corrompu", 55, _PNG_MIME)
+
+    assert sent_payloads == [payload]
+    assert sent_payloads[0].id_document == 55
+    assert sent_payloads[0].score_confiance == Decimal("0")
+
+
+def test_callback_error_does_not_crash_pipeline(
+    monkeypatch: pytest.MonkeyPatch,
+    mock_structure: None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Un échec définitif du callback est journalisé et avalé : la tâche de fond
+    ne plante pas, le pipeline retourne quand même le payload."""
+    monkeypatch.setattr(service, "extract_ocr_text", lambda content, *, is_pdf: "txt")
+
+    def _fail_send(payload: OcrWebhookPayload) -> None:
+        raise CallbackError("callback définitivement échoué")
+
+    monkeypatch.setattr(service, "send_callback", _fail_send)
+
+    with caplog.at_level("ERROR"):
+        payload = run_extraction_pipeline(b"image", 42, _PNG_MIME)
+
+    assert payload.id_document == 42  # pas d'exception propagée
+    assert "callback" in caplog.text
