@@ -32,6 +32,15 @@ from src.core.config import settings
 # redéploiement devient nécessaire.
 _RENDER_DPI = 300
 
+# Plafond de pages pour l'OCR d'un PDF scanné. Borne à la fois le temps de calcul
+# (``readtext`` est CPU-bound, sans timeout possible dans un thread — un vrai
+# timeout exigerait un process pool, cf. dette BackgroundTasks) et la mémoire
+# (chaque page rendue à 300 DPI pèse ~25 Mo en PNG, toutes matérialisées d'un
+# coup). Largement au-dessus d'une facture réelle ; au-delà, le document est
+# déclaré inexploitable (payload d'échec côté API data). Détail d'implémentation
+# (pas dans Settings) ; pourra être remonté en configuration si besoin.
+_MAX_OCR_PAGES = 20
+
 # Reader EasyOCR mis en cache : construit une seule fois (voir ``_get_reader``).
 _reader: Any = None
 
@@ -40,7 +49,8 @@ class OcrExtractionError(Exception):
     """Image ou PDF scanné illisible, ou aucun texte reconnu par l'OCR.
 
     Relevée quand PyMuPDF ne parvient pas à ouvrir le PDF, quand EasyOCR échoue
-    sur une image corrompue, ou quand l'OCR ne reconnaît finalement aucun texte.
+    sur une image corrompue, quand le PDF dépasse le plafond de pages
+    (``_MAX_OCR_PAGES``), ou quand l'OCR ne reconnaît finalement aucun texte.
     L'orchestrateur du pipeline attrape cette exception pour produire un résultat
     d'échec (``score_confiance = 0``) côté API data.
     """
@@ -82,11 +92,19 @@ def _pdf_to_images(content: bytes) -> list[bytes]:
     """Convertit chaque page d'un PDF scanné en image PNG (bytes), dans l'ordre.
 
     EasyOCR ne lit que des images : on rend chaque page à ``_RENDER_DPI`` avec
-    PyMuPDF, autonome (aucune dépendance système type poppler).
+    PyMuPDF, autonome (aucune dépendance système type poppler). Un PDF dépassant
+    ``_MAX_OCR_PAGES`` est rejeté avant tout rendu (borne temps + mémoire).
     """
     try:
         with fitz.open(stream=content, filetype="pdf") as doc:
+            if doc.page_count > _MAX_OCR_PAGES:
+                raise OcrExtractionError(
+                    f"PDF scanné de {doc.page_count} pages : plafond OCR de "
+                    f"{_MAX_OCR_PAGES} pages dépassé, document inexploitable."
+                )
             return [page.get_pixmap(dpi=_RENDER_DPI).tobytes("png") for page in doc]
+    except OcrExtractionError:
+        raise
     except Exception as exc:  # PyMuPDF lève des exceptions variées et peu typées
         raise OcrExtractionError(
             "PDF scanné illisible ou corrompu : conversion en image impossible."
@@ -110,8 +128,9 @@ def extract_ocr_text(content: bytes, *, is_pdf: bool) -> str:
         Le texte brut reconnu, concaténé dans l'ordre des pages.
 
     Raises:
-        OcrExtractionError: PDF/image illisible, ou aucun texte reconnu (document
-            inexploitable → ``score_confiance = 0`` côté API data).
+        OcrExtractionError: PDF/image illisible, PDF dépassant ``_MAX_OCR_PAGES``,
+            ou aucun texte reconnu (document inexploitable → ``score_confiance = 0``
+            côté API data).
     """
     if is_pdf:
         pages_text = [_ocr_image(image) for image in _pdf_to_images(content)]

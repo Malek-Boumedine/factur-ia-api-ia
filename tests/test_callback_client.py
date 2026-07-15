@@ -51,9 +51,9 @@ def _payload() -> OcrWebhookPayload:
 
 
 class _FakeResponse:
-    """Fausse réponse httpx : statut + corps JSON optionnel."""
+    """Fausse réponse httpx : statut + corps JSON optionnel (objet, liste...)."""
 
-    def __init__(self, status_code: int, json_body: dict[str, Any] | None = None):
+    def __init__(self, status_code: int, json_body: Any = None):
         self.status_code = status_code
         self._json_body = json_body
 
@@ -149,6 +149,16 @@ def test_success_without_json_body_does_not_crash(
 ) -> None:
     """Un 200 sans corps JSON exploitable reste un succès (log dégradé)."""
     _install(monkeypatch, [_FakeResponse(200)])
+
+    send_callback(_payload())  # ne doit pas lever
+
+
+def test_success_with_non_dict_json_body_does_not_crash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Un 200 dont le corps JSON n'est pas un objet (ex. liste) reste un succès :
+    la journalisation dégradée ne doit pas faire planter la tâche de fond."""
+    _install(monkeypatch, [_FakeResponse(200, [1, 2, 3])])
 
     send_callback(_payload())  # ne doit pas lever
 

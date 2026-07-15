@@ -18,6 +18,7 @@ from typing import Any
 import pytest
 from src.callback.client import CallbackError
 from src.callback.schemas import OcrWebhookPayload
+from src.core.config import settings
 from src.extractions import service
 from src.extractions.ocr_extractor import OcrExtractionError
 from src.extractions.pdf_detector import PdfType
@@ -210,6 +211,72 @@ def test_failure_payload_is_also_sent_to_callback(
     assert sent_payloads == [payload]
     assert sent_payloads[0].id_document == 55
     assert sent_payloads[0].score_confiance == Decimal("0")
+
+
+@pytest.mark.parametrize("exception_type", [RuntimeError, MemoryError])
+def test_unexpected_error_yields_failure_payload_sent_to_callback(
+    monkeypatch: pytest.MonkeyPatch,
+    sent_payloads: list[OcrWebhookPayload],
+    caplog: pytest.LogCaptureFixture,
+    exception_type: type[Exception],
+) -> None:
+    """Une exception hors union métier (bug, MemoryError) tombe dans le filet de
+    dernier recours : payload d'échec produit ET envoyé au callback (le document
+    ne reste jamais bloqué « en attente »), journalisé en ERROR."""
+
+    def _boom(content: bytes, *, is_pdf: bool) -> str:
+        raise exception_type("défaillance imprévue")
+
+    monkeypatch.setattr(service, "extract_ocr_text", _boom)
+
+    with caplog.at_level("ERROR"):
+        payload = run_extraction_pipeline(b"image", 77, _PNG_MIME)
+
+    assert payload.id_document == 77
+    assert payload.score_confiance == Decimal("0")  # marqueur unique d'échec
+    assert sent_payloads == [payload]  # le verdict part quand même au callback
+    assert "inattendue" in caplog.text
+    # Aucun secret ne doit fuiter dans les logs d'erreur.
+    assert settings.SECRET_OCR_TOKEN not in caplog.text
+    assert settings.GROQ_API_KEY not in caplog.text
+
+
+def test_unexpected_send_error_does_not_crash_pipeline(
+    monkeypatch: pytest.MonkeyPatch,
+    mock_structure: None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Une exception inattendue pendant l'envoi (non-CallbackError) est avalée et
+    journalisée en ERROR : la tâche de fond ne plante pas."""
+    monkeypatch.setattr(service, "extract_ocr_text", lambda content, *, is_pdf: "txt")
+
+    def _boom_send(payload: OcrWebhookPayload) -> None:
+        raise RuntimeError("défaillance imprévue pendant l'envoi")
+
+    monkeypatch.setattr(service, "send_callback", _boom_send)
+
+    with caplog.at_level("ERROR"):
+        payload = run_extraction_pipeline(b"image", 42, _PNG_MIME)
+
+    assert payload.id_document == 42  # pas d'exception propagée
+    assert "envoi au callback" in caplog.text
+    assert settings.SECRET_OCR_TOKEN not in caplog.text
+
+
+def test_pipeline_start_is_logged(
+    monkeypatch: pytest.MonkeyPatch,
+    mock_structure: None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Le début du pipeline est journalisé avec l'id_document : permet de repérer
+    un « début sans fin » (tâche qui pend ou meurt sans verdict)."""
+    monkeypatch.setattr(service, "extract_ocr_text", lambda content, *, is_pdf: "txt")
+
+    with caplog.at_level("INFO"):
+        run_extraction_pipeline(b"image", 42, _PNG_MIME)
+
+    assert "démarrée" in caplog.text
+    assert "42" in caplog.text
 
 
 def test_callback_error_does_not_crash_pipeline(

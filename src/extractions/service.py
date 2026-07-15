@@ -18,14 +18,17 @@ Routage d'extraction (l'orchestrateur connaît le ``content_type``) :
 - PDF → ``detect_pdf_type`` puis, selon le résultat, extraction native
   (``pdfplumber``) ou OCR (``extract_ocr_text(..., is_pdf=True)``).
 
-Gestion d'erreurs volontairement **minimale** ici : toutes les briques exposent
-le même contrat d'échec (« extraction inexploitable → ``score_confiance = 0`` »),
-donc un unique ``try/except`` englobant les traduit en payload d'échec via
-``build_failure_payload``. Le payload — succès **ou** échec — est ensuite POSTé
-au callback OCR de l'API data (retries gérés par ``callback.client``) ; un envoi
-définitivement échoué est seulement journalisé, le payload est perdu (limite
-assumée du choix ``BackgroundTasks``, cf. CLAUDE.md). La gestion fine des causes
-distinctes (timeouts par brique, etc.) reste une tâche ultérieure.
+Gestion d'erreurs à deux niveaux : toutes les briques exposent le même contrat
+d'échec (« extraction inexploitable → ``score_confiance = 0`` »), donc un
+``try/except`` englobant traduit les exceptions métier connues en payload
+d'échec via ``build_failure_payload`` (``WARNING``). Un filet ``except
+Exception`` de dernier recours couvre l'inattendu — bug, ``MemoryError``,
+exception d'une lib tierce non wrappée — et produit le même payload d'échec
+(``ERROR``) : sans verdict envoyé, le document resterait bloqué « en attente »
+pour toujours côté API data. Le payload — succès **ou** échec — est ensuite
+POSTé au callback OCR de l'API data (retries gérés par ``callback.client``) ;
+un envoi échoué, quelle qu'en soit la cause, est seulement journalisé, le
+payload est perdu (limite assumée du choix ``BackgroundTasks``, cf. CLAUDE.md).
 """
 
 import logging
@@ -104,10 +107,10 @@ def run_extraction_pipeline(
     Enchaîne extraction du texte, structuration LLM, calcul du score de confiance
     et validation contre ``OcrWebhookPayload``. En cas d'échec d'une brique
     (document illisible, appel LLM en erreur, JSON inexploitable, validation
-    contrat impossible), produit le payload d'échec canonique
-    (``score_confiance = 0``) plutôt que de propager l'exception : la tâche de
-    fond ne doit jamais planter silencieusement, l'API data doit recevoir un
-    verdict d'échec exploitable.
+    contrat impossible) — ou de toute exception inattendue (filet de dernier
+    recours) — produit le payload d'échec canonique (``score_confiance = 0``)
+    plutôt que de propager l'exception : la tâche de fond ne doit jamais planter
+    silencieusement, l'API data doit recevoir un verdict d'échec exploitable.
 
     Le payload — succès **ou** échec — est ensuite POSTé au callback OCR de
     l'API data (c'est le payload d'échec qui fait passer le document en
@@ -125,6 +128,14 @@ def run_extraction_pipeline(
         L'``OcrWebhookPayload`` envoyé au callback : soit l'extraction validée
         (``score_confiance > 0``), soit le payload d'échec (``score_confiance = 0``).
     """
+    # Log de début : repérer les « début sans fin » (tâche qui pend ou meurt sans
+    # verdict), le pipeline pouvant être long (OCR + LLM).
+    logger.info(
+        "Document %s — extraction démarrée (%s).",
+        id_document,
+        content_type,
+    )
+
     try:
         raw_text = _extract_text(content, content_type)
         structured = structure_invoice(raw_text)
@@ -154,6 +165,17 @@ def run_extraction_pipeline(
             exc_info=True,
         )
         payload = build_failure_payload(id_document)
+    except Exception:
+        # Filet de dernier recours (bug, MemoryError, exception d'une lib tierce
+        # non wrappée) : sans verdict envoyé, le document resterait bloqué « en
+        # attente » pour toujours côté API data. ERROR (vs WARNING métier) : un
+        # échec inattendu est probablement un bug et doit faire du bruit.
+        logger.error(
+            "Document %s — erreur inattendue dans le pipeline, payload d'échec émis.",
+            id_document,
+            exc_info=True,
+        )
+        payload = build_failure_payload(id_document)
 
     # Envoi au callback dans TOUS les cas : le payload d'échec doit remonter à
     # l'API data pour passer le document en « erreur ». Un échec définitif de
@@ -165,6 +187,15 @@ def run_extraction_pipeline(
     except CallbackError:
         logger.error(
             "Document %s — envoi au callback définitivement échoué, payload perdu.",
+            id_document,
+            exc_info=True,
+        )
+    except Exception:
+        # Même filet que le pipeline : une erreur inattendue pendant l'envoi ne
+        # doit pas faire planter la tâche de fond.
+        logger.error(
+            "Document %s — erreur inattendue pendant l'envoi au callback, "
+            "payload perdu.",
             id_document,
             exc_info=True,
         )

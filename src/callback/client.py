@@ -57,12 +57,19 @@ def _build_client() -> httpx.Client:
 
 
 def _log_success(id_document: int, response: httpx.Response) -> None:
-    """Journalise la confirmation renvoyée par l'API data (ids créés côté data)."""
+    """Journalise la confirmation renvoyée par l'API data (ids créés côté data).
+
+    Purement informatif : un corps absent, non-JSON ou d'une forme inattendue
+    (non-objet) donne un log dégradé, jamais une exception — le callback a été
+    accepté, la tâche de fond ne doit pas planter sur de la journalisation.
+    """
     try:
         data = response.json()
     except ValueError:
+        data = None
+    if not isinstance(data, dict):
         logger.info(
-            "Document %s — callback OCR accepté (réponse sans corps JSON).",
+            "Document %s — callback OCR accepté (réponse sans corps JSON exploitable).",
             id_document,
         )
         return
