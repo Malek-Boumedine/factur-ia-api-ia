@@ -3,16 +3,26 @@
 Contrat figé avec l'API data : `POST /extractions`, `multipart/form-data`
 avec `file` + `id_document`, protégé par le header `X-OCR-Secret-Token`.
 
-Cette version se limite à la réception : validation du type et de la taille
-du fichier, puis accusé de réception `202`. Le pipeline d'extraction
-(OCR / LLM / callback) sera branché dans une tâche ultérieure.
+Réception : validation du type et de la taille du fichier, accusé de réception
+`202` immédiat, puis extraction déclenchée en tâche de fond
+(`fastapi.BackgroundTasks`, compromis MVP assumé — cf. CLAUDE.md).
 """
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    UploadFile,
+    status,
+)
 
 from src.core.config import settings
 from src.core.security import verify_ocr_token
 from src.extractions.schemas import ExtractionAccepted
+from src.extractions.service import run_extraction_pipeline
 
 # Types MIME acceptés, cohérents avec ce que transmet l'API data.
 ALLOWED_MIME_TYPES = frozenset(
@@ -66,19 +76,30 @@ async def _validate_upload(file: UploadFile) -> None:
     summary="Réception d'un document à extraire",
 )
 async def receive_extraction(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     id_document: int = Form(...),
 ) -> ExtractionAccepted:
-    """Reçoit un document, le valide et accuse réception.
+    """Reçoit un document, le valide, accuse réception et déclenche l'extraction.
 
-    Renvoie `202` immédiatement (traitement asynchrone prévu). Le token
-    `X-OCR-Secret-Token` est vérifié en amont par la dépendance.
+    Renvoie `202` immédiatement, puis l'extraction est traitée en tâche de fond.
+    Le token `X-OCR-Secret-Token` est vérifié en amont par la dépendance.
+
+    Le contenu est lu ici, avant le `202` : l'`UploadFile` (fichier temporaire)
+    peut être fermé quand la tâche de fond s'exécute, on transmet donc des octets
+    immuables à l'orchestrateur.
     """
     await _validate_upload(file)
 
-    # TODO(pipeline): déclencher l'orchestrateur d'extraction en tâche de fond
-    # (fastapi.BackgroundTasks -> extractions.service), qui poussera le
-    # résultat vers le callback de l'API data. Le contenu de `file` (rembobiné)
-    # sera transmis ici. Rien n'est traité pour l'instant.
+    # content_type garanti non-null et dans ALLOWED_MIME_TYPES par _validate_upload.
+    content = await file.read()
+    content_type = file.content_type or ""
+
+    background_tasks.add_task(
+        run_extraction_pipeline,
+        content,
+        id_document,
+        content_type,
+    )
 
     return ExtractionAccepted(id_document=id_document)
