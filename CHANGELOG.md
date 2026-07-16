@@ -2,6 +2,20 @@
 
 <!-- version list -->
 
+## v1.3.0 (2026-07-16)
+
+### Features
+
+- **callback**: Renvoi du résultat d'extraction à l'API data
+  ([`2a9b119`](https://github.com/Malek-Boumedine/factur-ia-api-ia/commit/2a9b119ef8654e8db41bb695106f416bb22790a7))
+
+- **extractions**: Assemble le pipeline complet d'extraction
+  ([`faaa1c5`](https://github.com/Malek-Boumedine/factur-ia-api-ia/commit/faaa1c53880716791cec55b30994a5a35e77a70d))
+
+- **extractions**: Fiabilise la gestion d'erreurs de bout en bout du pipeline
+  ([`651085e`](https://github.com/Malek-Boumedine/factur-ia-api-ia/commit/651085ee72f265cea57739d045541c1a106c92c4))
+
+
 ## v1.2.0 (2026-07-15)
 
 ### Features
