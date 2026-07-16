@@ -103,6 +103,32 @@ def test_ocr_empty_result_raises(monkeypatch: pytest.MonkeyPatch) -> None:
         extract_ocr_text(b"fake-image-bytes", is_pdf=False)
 
 
+def test_ocr_pdf_over_page_cap_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Un PDF scanné au-delà du plafond de pages est rejeté AVANT tout rendu/OCR
+    (borne temps + mémoire), en OcrExtractionError → payload d'échec en aval."""
+    reader = _FakeReader(["ne devrait pas etre appele"])
+    monkeypatch.setattr(ocr_extractor, "_get_reader", lambda: reader)
+    monkeypatch.setattr(ocr_extractor, "_MAX_OCR_PAGES", 2)
+
+    with pytest.raises(OcrExtractionError):
+        extract_ocr_text(_pdf_with_pages(3), is_pdf=True)
+
+    assert reader.calls == 0  # rejeté avant tout appel OCR
+
+
+def test_ocr_pdf_at_page_cap_passes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Un PDF exactement au plafond passe normalement (la borne est inclusive)."""
+    reader = _FakeReader(["PAGE 1"], ["PAGE 2"])
+    monkeypatch.setattr(ocr_extractor, "_get_reader", lambda: reader)
+    monkeypatch.setattr(ocr_extractor, "_MAX_OCR_PAGES", 2)
+
+    result = extract_ocr_text(_pdf_with_pages(2), is_pdf=True)
+
+    assert reader.calls == 2
+    assert "PAGE 1" in result
+    assert "PAGE 2" in result
+
+
 def test_reader_built_once(monkeypatch: pytest.MonkeyPatch) -> None:
     # Le Reader (coûteux) ne doit être construit qu'une seule fois puis réutilisé.
     calls = {"count": 0}

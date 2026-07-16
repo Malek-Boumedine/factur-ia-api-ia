@@ -2,6 +2,26 @@
 
 <!-- version list -->
 
+## v1.2.0 (2026-07-15)
+
+### Features
+
+- **extractions**: Client LLM Groq pour la structuration
+  ([`fc424f7`](https://github.com/Malek-Boumedine/factur-ia-api-ia/commit/fc424f79c28324ea581abc8fac6d228257f445be))
+
+- **extractions**: Détection du type de document (devis/facture/avoir)
+  ([`f5c4a31`](https://github.com/Malek-Boumedine/factur-ia-api-ia/commit/f5c4a318b90f344518f21f727fbaa625869d989a))
+
+- **extractions**: Score de confiance déterministe de l'extraction
+  ([`c1e3591`](https://github.com/Malek-Boumedine/factur-ia-api-ia/commit/c1e3591dd14538bfedc6828d35fafad081930a78))
+
+- **extractions**: Structuration LLM du texte en données de facture
+  ([`5f2f1cc`](https://github.com/Malek-Boumedine/factur-ia-api-ia/commit/5f2f1cc5e8dcfbd1f006c051353a3bd822bd5c08))
+
+- **extractions**: Validation Pydantic et gestion des extractions inexploitables
+  ([`87616f0`](https://github.com/Malek-Boumedine/factur-ia-api-ia/commit/87616f0ad914670d17051674100876485efef413))
+
+
 ## v1.1.0 (2026-07-06)
 
 ### Features
