@@ -51,7 +51,8 @@ class TypeDocument(StrEnum):
 
 # Prompt système : consignes d'extraction. En français (destiné au modèle), il
 # insiste sur les points sensibles constatés (taux TVA confondu avec un id,
-# montants mal formatés, champs inventés, confusion émetteur/destinataire).
+# montants mal formatés, séparateur de milliers français tronqué — « 1 850,00 »
+# lu 850 —, champs inventés, confusion émetteur/destinataire).
 SYSTEM_PROMPT = """\
 Tu es un assistant spécialisé dans l'extraction de données de factures françaises.
 On te fournit le texte brut d'une seule facture (issu d'une extraction PDF ou d'un
@@ -65,9 +66,17 @@ Règles impératives :
   `null` qu'une valeur devinée. Cela vaut aussi pour les totaux.
 - `taux_tva` est un TAUX DE TVA EN POURCENTAGE (par exemple `20.00`, `10.00`,
   `5.50`, `0.00`), jamais un identifiant, un code, ni un montant de TVA en euros.
-- Les montants (`total_ht`, `total_tva`, `total_ttc`, `prix_unitaire_ht`) sont des
-  nombres décimaux : point comme séparateur décimal, sans séparateur de milliers,
-  sans symbole monétaire ni texte (écris `1234.56`, pas `1 234,56 €`).
+- LECTURE des montants : le texte source utilise le format français des nombres.
+  L'espace entre groupes de chiffres (espace normal, insécable ou fine) est un
+  séparateur de milliers : agrège les groupes en un seul nombre. La virgule est le
+  séparateur décimal. Exemples : « 1 850,00 » vaut `1850.00` ; « 12 345,67 » vaut
+  `12345.67` ; « 850,00 » vaut `850.00`. Ne tronque JAMAIS les chiffres situés
+  avant un espace : dans une ligne de tableau, un chiffre isolé devant un groupe
+  de chiffres est souvent le début du montant (le millier), pas une quantité.
+- ÉCRITURE des montants (`total_ht`, `total_tva`, `total_ttc`,
+  `prix_unitaire_ht`) : nombres décimaux avec le point comme séparateur décimal,
+  sans séparateur de milliers, sans symbole monétaire ni texte (écris `1850.00`,
+  pas `1 850,00 €`).
 - `date_emission` est au format ISO `AAAA-MM-JJ` (par exemple `2026-07-06`).
 - Distingue bien l'ÉMETTEUR du DESTINATAIRE : `siret_emetteur` est le SIRET du
   vendeur / prestataire qui émet la facture ; `siret_destinataire` est le SIRET du
