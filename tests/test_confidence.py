@@ -52,6 +52,32 @@ def _facture(**overrides: Any) -> dict[str, Any]:
     return facture
 
 
+# --- Quantification (par_champ part au callback) ----------------------------
+
+
+def test_par_champ_quantifie_a_quatre_decimales() -> None:
+    """Les scores par champ sont quantifiés à 4 décimales avant restitution :
+    une moyenne périodique (2.5/3) ressort 0.8333, pas un Decimal à 28 décimales."""
+    ligne_valide = {
+        "designation": "Prestation de conseil",
+        "quantite": 2,
+        "prix_unitaire_ht": Decimal("500.00"),
+        "taux_tva": Decimal("20.00"),
+    }
+    # 2 contrôles sur 4 valides (prix absent, taux illégal) → score de ligne 0.5.
+    ligne_douteuse = {
+        "designation": "Fourniture",
+        "quantite": 1,
+        "prix_unitaire_ht": None,
+        "taux_tva": Decimal("19"),
+    }
+    result = compute_confidence(
+        _facture(lignes=[ligne_valide, ligne_valide, ligne_douteuse])
+    )
+
+    assert result.par_champ["lignes"] == Decimal("0.8333")
+
+
 # --- Cas nominal -----------------------------------------------------------
 
 

@@ -24,9 +24,10 @@ et champs optionnels exprimés par une union avec ``null`` (``["string", "null"]
 
 Le schéma effectivement envoyé au LLM (``INVOICE_JSON_SCHEMA``) ajoute au miroir du
 contrat un champ ``type_document`` (suggestion de classification devis/facture/avoir/
-inconnu). Ce champ n'appartient PAS à ``OcrWebhookPayload`` : il est ajouté à plat
-au schéma pour être produit dans le même appel LLM, puis séparé du sous-ensemble
-contrat côté ``structurer.py``. Le miroir pur du contrat reste ``_INVOICE_SCHEMA``.
+inconnu), produit dans le même appel LLM puis séparé du sous-ensemble « données
+extraites » côté ``structurer.py``. Il rejoint le contrat plus loin dans le
+pipeline, via le champ optionnel ``type_document`` d'``OcrWebhookPayload``. Le
+miroir pur du sous-ensemble « données extraites » reste ``_INVOICE_SCHEMA``.
 """
 
 from enum import StrEnum
@@ -37,9 +38,9 @@ class TypeDocument(StrEnum):
     """Nature du document détectée par l'IA — suggestion non contraignante.
 
     La décision finale revient à l'humain (validation human-in-the-loop côté API
-    data / front). Ce type ne fait PAS partie du contrat ``OcrWebhookPayload`` : il
-    n'est pas transmis au callback, il reste dans la sortie interne de
-    structuration. Source unique des valeurs autorisées du champ ``type_document``
+    data / front). Transmise au callback via le champ optionnel ``type_document``
+    d'``OcrWebhookPayload`` (le ``Literal`` du contrat doit rester synchronisé avec
+    ces valeurs). Source unique des valeurs autorisées du champ ``type_document``
     du schéma LLM.
     """
 

@@ -1,5 +1,6 @@
 from datetime import date
 from decimal import Decimal
+from typing import Literal
 
 from pydantic import BaseModel
 
@@ -23,3 +24,10 @@ class OcrWebhookPayload(BaseModel):
     total_ttc: Decimal
     iban: str | None = None
     lignes: list[LigneOcr] = []
+    # Extension additive du contrat (optionnels, ``None`` = non calculé — payload
+    # d'échec ou version antérieure du service) : le type de document suggéré par
+    # l'IA (décision finale à l'humain) et la confiance par champ (clés = noms des
+    # champs ci-dessus, scores 0-1 quantifiés à 4 décimales) pour le surlignage
+    # des champs douteux côté front.
+    type_document: Literal["devis", "facture", "avoir", "inconnu"] | None = None
+    par_champ: dict[str, Decimal] | None = None

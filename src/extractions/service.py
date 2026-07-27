@@ -140,10 +140,10 @@ def run_extraction_pipeline(
         raw_text = _extract_text(content, content_type)
         structured = structure_invoice(raw_text)
 
-        # ``type_document`` est une suggestion IA interne, HORS contrat : jamais
-        # transmise au callback, seulement journalisée (décision finale à l'humain).
+        # ``type_document`` est une suggestion IA non contraignante, transmise au
+        # callback dans le champ optionnel du contrat (décision finale à l'humain).
         logger.info(
-            "Document %s — type suggéré (interne, non transmis) : %s",
+            "Document %s — type suggéré : %s",
             id_document,
             structured["type_document"],
         )
@@ -161,7 +161,13 @@ def run_extraction_pipeline(
         )
 
         confidence = compute_confidence(facture)
-        payload = validate_extraction(id_document, facture, confidence.score_global)
+        payload = validate_extraction(
+            id_document,
+            facture,
+            confidence.score_global,
+            par_champ=confidence.par_champ,
+            type_document=structured["type_document"],
+        )
         logger.info(
             "Document %s — extraction réussie (score de confiance : %s).",
             id_document,

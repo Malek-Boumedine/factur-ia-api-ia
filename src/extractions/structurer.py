@@ -7,11 +7,11 @@ parse ce JSON en ``dict`` Python, on en sépare la suggestion de type et on renv
 le tout.
 
 Le schéma LLM inclut, à plat, un champ ``type_document`` (suggestion devis/facture/
-avoir/inconnu) qui ne fait PAS partie du contrat ``OcrWebhookPayload``. Après
-parsing, on l'extrait du ``dict`` et on renvoie deux blocs distincts :
-``type_document`` (la suggestion IA, non contraignante, non transmise au callback)
-et ``facture`` (le sous-ensemble contrat, débarrassé de ``type_document``). La
-décision finale sur le type revient à l'humain (human-in-the-loop côté API data).
+avoir/inconnu). Après parsing, on l'extrait du ``dict`` et on renvoie deux blocs
+distincts : ``type_document`` (la suggestion IA, non contraignante, transmise au
+callback via le champ optionnel du contrat) et ``facture`` (le sous-ensemble
+« données extraites », débarrassé de ``type_document``). La décision finale sur le
+type revient à l'humain (human-in-the-loop côté API data).
 
 Ce module ne fait *que* la structuration. Il ne valide PAS le résultat contre
 ``OcrWebhookPayload`` (types, champs requis, cohérence des montants) et ne calcule
@@ -56,7 +56,7 @@ def structure_invoice(raw_text: str) -> dict[str, Any]:
     sont convertis en ``Decimal`` (``parse_float=Decimal``) pour préserver la
     précision monétaire exacte, en vue de la validation ``Decimal`` ultérieure.
 
-    Sépare ensuite la suggestion de type (hors contrat) du sous-ensemble contrat :
+    Sépare ensuite la suggestion de type du sous-ensemble « données extraites » :
     ``type_document`` est extrait du ``dict`` parsé et converti en ``TypeDocument``
     (``INCONNU`` si absent ou valeur inattendue) ; le reste devient ``facture``,
     reflet du sous-ensemble « données extraites » de ``OcrWebhookPayload`` (sans
@@ -69,8 +69,8 @@ def structure_invoice(raw_text: str) -> dict[str, Any]:
 
     Returns:
         Un ``dict`` à deux clés : ``type_document`` (``TypeDocument``, suggestion IA
-        non contraignante, non transmise au callback) et ``facture`` (``dict`` des
-        champs contrat, montants en ``Decimal``).
+        non contraignante, transmise au callback via le champ optionnel du contrat)
+        et ``facture`` (``dict`` des champs contrat, montants en ``Decimal``).
 
     Raises:
         LlmStructurationError: la réponse du modèle n'est pas un JSON exploitable.

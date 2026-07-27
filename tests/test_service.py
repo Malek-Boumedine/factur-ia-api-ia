@@ -162,6 +162,33 @@ def test_final_payload_is_correct(
     assert payload.lignes[0].designation == "Prestation de conseil"
 
 
+def test_final_payload_carries_type_and_par_champ(
+    monkeypatch: pytest.MonkeyPatch, mock_structure: None
+) -> None:
+    """Le payload de succès transmet le type suggéré et la confiance par champ
+    (champs optionnels du contrat, propagés du pipeline jusqu'au callback)."""
+    monkeypatch.setattr(service, "extract_ocr_text", lambda content, *, is_pdf: "txt")
+
+    payload = run_extraction_pipeline(b"image", 123, _PNG_MIME)
+
+    assert payload.type_document == "facture"
+    assert payload.par_champ is not None
+    assert set(payload.par_champ) == {
+        "siret_emetteur",
+        "siret_destinataire",
+        "numero_facture",
+        "date_emission",
+        "total_ht",
+        "total_tva",
+        "total_ttc",
+        "iban",
+        "lignes",
+    }
+    assert all(
+        Decimal("0") <= score <= Decimal("1") for score in payload.par_champ.values()
+    )
+
+
 def test_extraction_failure_yields_failure_payload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -178,6 +205,9 @@ def test_extraction_failure_yields_failure_payload(
     assert payload.score_confiance == Decimal("0")  # marqueur unique d'échec
     assert payload.total_ht == Decimal("0")
     assert payload.lignes == []
+    # Le payload d'échec ne porte pas les champs optionnels du contrat.
+    assert payload.type_document is None
+    assert payload.par_champ is None
 
 
 def test_success_payload_is_sent_to_callback(

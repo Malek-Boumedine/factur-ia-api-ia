@@ -11,6 +11,7 @@ from decimal import Decimal
 from typing import Any
 
 import pytest
+from src.extractions.prompts import TypeDocument
 from src.extractions.validation import (
     PayloadValidationError,
     build_failure_payload,
@@ -19,6 +20,12 @@ from src.extractions.validation import (
 
 _ID = 42
 _SCORE = Decimal("0.87")
+# Confiances par champ représentatives (sous-ensemble suffisant : transmis tel quel).
+_PAR_CHAMP = {
+    "siret_emetteur": Decimal("1.0000"),
+    "total_ht": Decimal("0.4000"),
+    "lignes": Decimal("0.8333"),
+}
 
 
 def _facture(**overrides: Any) -> dict[str, Any]:
@@ -65,6 +72,49 @@ def test_score_confiance_preserve() -> None:
     """Le score fourni (issu de compute_confidence) est transmis tel quel."""
     payload = validate_extraction(_ID, _facture(), Decimal("0.05"))
     assert payload.score_confiance == Decimal("0.05")
+
+
+# --- Champs optionnels du contrat (par_champ, type_document) ----------------
+
+
+def test_par_champ_et_type_document_transmis() -> None:
+    """Les champs optionnels fournis sont transmis tels quels dans le payload."""
+    payload = validate_extraction(
+        _ID,
+        _facture(),
+        _SCORE,
+        par_champ=_PAR_CHAMP,
+        type_document=TypeDocument.FACTURE,
+    )
+
+    assert payload.par_champ == _PAR_CHAMP
+    assert payload.type_document == "facture"
+
+
+def test_retrocompatibilite_sans_champs_optionnels() -> None:
+    """Sans les champs optionnels (appel à 3 arguments), le payload reste valide :
+    ``par_champ`` et ``type_document`` à None (ajout additif au contrat)."""
+    payload = validate_extraction(_ID, _facture(), _SCORE)
+
+    assert payload.par_champ is None
+    assert payload.type_document is None
+    assert payload.score_confiance == _SCORE  # champs existants inchangés
+
+
+def test_inexploitable_omet_les_champs_optionnels() -> None:
+    """Le payload d'échec ne porte jamais par_champ ni type_document, même fournis :
+    un échec n'a rien d'exploitable (contrat d'échec minimal)."""
+    payload = validate_extraction(
+        _ID,
+        _facture(total_ht=None, total_tva=None, total_ttc=None, lignes=[]),
+        _SCORE,
+        par_champ=_PAR_CHAMP,
+        type_document=TypeDocument.DEVIS,
+    )
+
+    assert payload.score_confiance == Decimal("0")
+    assert payload.par_champ is None
+    assert payload.type_document is None
 
 
 # --- Divergence null sur les totaux ----------------------------------------
@@ -191,3 +241,5 @@ def test_build_failure_payload_forme() -> None:
     assert payload.lignes == []
     assert payload.siret_emetteur is None
     assert payload.date_emission is None
+    assert payload.par_champ is None
+    assert payload.type_document is None

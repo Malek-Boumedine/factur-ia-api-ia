@@ -14,14 +14,13 @@ C'est le plafond assumé de l'approche, et la raison d'être de la relecture hum
 score qui a un sens réel, pas décoratif. Une auto-évaluation par le LLM serait
 complaisante ; elle pourra être ajoutée plus tard en appoint plafonné.
 
-Deux sorties dans ``ConfidenceResult`` :
+Deux sorties dans ``ConfidenceResult``, toutes deux transmises au callback :
 
-- ``score_global`` (``Decimal`` dans ``(0, 1]``) : le seul transmis au callback, il
-  alimente ``OcrWebhookPayload.score_confiance``.
-- ``par_champ`` (``dict`` champ → confiance) : **interne, non transmis**. Le contrat
-  ne porte qu'un score global ; ces confiances par-champ sont calculées et prêtes
-  pour un futur surlignage champ par champ côté front, quand le contrat sera étendu
-  (tâche cross-service séparée). Voir ``src/callback/schemas.py``.
+- ``score_global`` (``Decimal`` dans ``(0, 1]``) : alimente
+  ``OcrWebhookPayload.score_confiance``.
+- ``par_champ`` (``dict`` champ → confiance, quantifiée à ``_QUANTUM``) : alimente
+  ``OcrWebhookPayload.par_champ`` (champ optionnel du contrat) pour le surlignage
+  des champs douteux côté front. Voir ``src/callback/schemas.py``.
 
 Marqueur d'échec : ``score_confiance = 0`` est un **sentinelle réservé** signifiant
 « extraction inexploitable », émis *uniquement* par l'orchestrateur sur le chemin
@@ -55,7 +54,9 @@ _INTEGRITY_FAILED = Decimal("0.4")
 # Confiance d'un champ présent mais manifestement mal formé (mauvaise longueur).
 _MALFORMED = Decimal("0.2")
 
-# Précision de restitution du score global.
+# Précision de restitution des scores transmis au callback (global et par champ) :
+# 4 décimales, pour éviter d'exposer les 28 décimales d'une division Decimal
+# (ex. moyenne de lignes à ``1/3``).
 _QUANTUM = Decimal("0.0001")
 
 # Malus multiplicatif du score global quand l'incohérence croisée « somme des
@@ -110,9 +111,10 @@ class ConfidenceResult:
 
     Attributes:
         score_global: confiance globale dans ``(0, 1]`` (jamais 0), destinée à
-            ``OcrWebhookPayload.score_confiance`` — le seul champ transmis.
-        par_champ: confiance par champ (``0`` à ``1``), **interne, non transmise**.
-            Prête pour un futur surlignage champ par champ côté front.
+            ``OcrWebhookPayload.score_confiance``.
+        par_champ: confiance par champ (``0`` à ``1``, quantifiée à ``_QUANTUM``),
+            destinée à ``OcrWebhookPayload.par_champ`` pour le surlignage des
+            champs douteux côté front.
     """
 
     score_global: Decimal
@@ -320,8 +322,9 @@ def compute_confidence(facture: dict[str, Any]) -> ConfidenceResult:
     ``facture`` (issu de ``structurer.py``, montants en ``Decimal``), puis agrège en
     une moyenne pondérée : les champs critiques absents sont comptés (confiance 0),
     les non-critiques absents sont exclus de la moyenne mais restent signalés à 0
-    dans ``par_champ``. Une incohérence croisée « somme des lignes ≠ total HT »
-    confirmée par un triplet cohérent applique en plus le malus global
+    dans ``par_champ`` (quantifié à ``_QUANTUM`` avant restitution, comme le score
+    global — il part au callback). Une incohérence croisée « somme des lignes ≠
+    total HT » confirmée par un triplet cohérent applique en plus le malus global
     ``_CROSS_CHECK_PENALTY``. Le résultat est plafonné par le bas à ``_FLOOR`` : il
     ne vaut **jamais 0** (sentinelle « inexploitable » réservée à l'orchestrateur).
 
@@ -330,8 +333,9 @@ def compute_confidence(facture: dict[str, Any]) -> ConfidenceResult:
             sans ``id_document`` ni ``score_confiance``), montants en ``Decimal``.
 
     Returns:
-        ``ConfidenceResult`` : ``score_global`` dans ``(0, 1]`` (transmis au callback)
-        et ``par_champ`` (interne, prêt pour le surlignage front futur).
+        ``ConfidenceResult`` : ``score_global`` dans ``(0, 1]`` et ``par_champ``
+        (confiances par champ pour le surlignage front), tous deux transmis au
+        callback.
     """
     ht = _as_decimal(facture.get("total_ht"))
     tva = _as_decimal(facture.get("total_tva"))
@@ -375,4 +379,9 @@ def compute_confidence(facture: dict[str, Any]) -> ConfidenceResult:
         raw *= _CROSS_CHECK_PENALTY
     score_global = max(raw, _FLOOR).quantize(_QUANTUM)
 
-    return ConfidenceResult(score_global=score_global, par_champ=par_champ)
+    return ConfidenceResult(
+        score_global=score_global,
+        par_champ={
+            field: score.quantize(_QUANTUM) for field, score in par_champ.items()
+        },
+    )
