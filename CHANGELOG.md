@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v1.4.0 (2026-07-27)
+
+### Bug Fixes
+
+- **extractions**: Corrige la lecture des montants au format français
+  ([`26108b4`](https://github.com/Malek-Boumedine/factur-ia-api-ia/commit/26108b4532b3f97b228b4cbc383f1d659fc2d6a2))
+
+### Features
+
+- **extractions**: Détecte l'incohérence entre les lignes et le total HT dans le score de confiance
+  ([`435c506`](https://github.com/Malek-Boumedine/factur-ia-api-ia/commit/435c50676a83f2a7de5b4c3a588f054e13fa87bc))
+
+
 ## v1.3.0 (2026-07-16)
 
 ### Features
