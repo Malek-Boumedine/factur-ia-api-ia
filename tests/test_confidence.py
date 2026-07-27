@@ -12,6 +12,7 @@ from decimal import Decimal
 from typing import Any
 
 from src.extractions.confidence import (
+    _CROSS_CHECK_PENALTY,
     _FLOOR,
     _INTEGRITY_FAILED,
     _MALFORMED,
@@ -117,12 +118,16 @@ def test_iban_invalide_penalise() -> None:
 
 
 def test_taux_tva_illegal_degrade_les_lignes() -> None:
-    """Un taux de TVA hors taux légaux fait baisser la confiance des lignes."""
+    """Un taux de TVA hors taux légaux fait baisser la confiance des lignes.
+
+    La ligne somme au total HT du fixture (1 × 1000) : la cohérence croisée est
+    bonne, on isole le seul contrôle du taux.
+    """
     lignes = [
         {
             "designation": "Article",
             "quantite": 1,
-            "prix_unitaire_ht": Decimal("100.00"),
+            "prix_unitaire_ht": Decimal("1000.00"),
             "taux_tva": Decimal("17.00"),  # taux inexistant en France
         }
     ]
@@ -194,9 +199,146 @@ def test_tolerance_centime_sur_les_totaux() -> None:
 
 
 def test_totaux_presents_mais_non_recoupables() -> None:
-    """Total présent sans les autres → présent mais non vérifiable (ni 1, ni 0)."""
+    """Total présent sans les autres → présent mais non vérifiable (ni 1, ni 0).
+
+    Lignes du fixture cohérentes avec le total HT (2 × 500 = 1000) : le contrôle
+    croisé n'interfère pas, on isole le verdict « non recoupable » du triplet.
+    """
     result = compute_confidence(_facture(total_tva=None, total_ttc=None))
     assert result.par_champ["total_ht"] == _UNVERIFIED_PRESENT
+
+
+# --- Cohérence croisée lignes / total HT -------------------------------------
+
+
+def _lignes(*prix: str) -> list[dict[str, Any]]:
+    """Lignes structurellement valides (quantité 1, taux légal) aux prix donnés."""
+    return [
+        {
+            "designation": f"Prestation {i}",
+            "quantite": 1,
+            "prix_unitaire_ht": Decimal(p),
+            "taux_tva": Decimal("20.00"),
+        }
+        for i, p in enumerate(prix, start=1)
+    ]
+
+
+def test_lignes_coherentes_avec_total_score_inchange() -> None:
+    """Somme des lignes = total HT → aucun effet, le score structurel reste plein."""
+    result = compute_confidence(_facture())  # 2 × 500 = 1000 = total_ht
+    assert result.par_champ["lignes"] == Decimal("1")
+    assert result.par_champ["total_ht"] == Decimal("1")
+
+
+def test_ligne_sous_evaluee_confirmee_fait_chuter_le_score() -> None:
+    """Cas réel : ligne extraite 850 au lieu de 1850, triplet cohérent.
+
+    850 + 480 + 660 = 1990 ≠ 2990, et HT + TVA = TTC se corroborent → l'erreur
+    est imputée aux lignes (plafond) et le malus global s'applique : le score
+    tombe mathématiquement sous ``_CROSS_CHECK_PENALTY``, donc sous le seuil
+    d'alerte 0.7 — l'erreur monétaire devient visible sur le seul score transmis.
+    """
+    result = compute_confidence(
+        _facture(
+            total_ht=Decimal("2990.00"),
+            total_tva=Decimal("598.00"),
+            total_ttc=Decimal("3588.00"),
+            lignes=_lignes("850.00", "480.00", "660.00"),
+        )
+    )
+
+    assert result.par_champ["lignes"] == _INTEGRITY_FAILED
+    # Triplet cohérent : les totaux gardent leur confiance pleine.
+    assert result.par_champ["total_ht"] == Decimal("1")
+    assert result.score_global <= _CROSS_CHECK_PENALTY
+    assert result.score_global < Decimal("0.7")
+
+
+def test_incoherence_non_confirmee_plafonds_sans_malus() -> None:
+    """Triplet invérifiable : coupable indésignable → lignes ET total HT plafonnés.
+
+    Pas de malus global (le signal est ambigu, un total absent peut expliquer
+    l'écart) : la pénalité passe uniquement par les plafonds par champ.
+    """
+    result = compute_confidence(
+        _facture(
+            total_ht=Decimal("2990.00"),
+            total_tva=None,
+            total_ttc=None,
+            lignes=_lignes("850.00", "480.00", "660.00"),
+        )
+    )
+
+    assert result.par_champ["lignes"] == _INTEGRITY_FAILED
+    assert result.par_champ["total_ht"] == _INTEGRITY_FAILED
+
+
+def test_pas_de_lignes_verdict_neutre() -> None:
+    """Sans lignes, le contrôle croisé est invérifiable : aucun plafond appliqué."""
+    result = compute_confidence(_facture(lignes=[], total_tva=None, total_ttc=None))
+    # Sans le verdict neutre, total_ht serait plafonné à _INTEGRITY_FAILED.
+    assert result.par_champ["total_ht"] == _UNVERIFIED_PRESENT
+
+
+def test_total_ht_absent_verdict_neutre() -> None:
+    """Sans total HT, le contrôle croisé est invérifiable : lignes non pénalisées."""
+    result = compute_confidence(_facture(total_ht=None))
+    assert result.par_champ["lignes"] == Decimal("1")
+
+
+def test_ligne_au_prix_null_verdict_neutre() -> None:
+    """Une ligne sans prix rend la somme incalculable : pas de fausse incohérence.
+
+    La ligne reste pénalisée structurellement (prix manquant → 3 contrôles sur 4),
+    mais ni plafond croisé ni malus — et le total HT garde sa confiance.
+    """
+    lignes = _lignes("1000.00")
+    lignes[0]["prix_unitaire_ht"] = None
+    result = compute_confidence(_facture(lignes=lignes))
+
+    assert result.par_champ["lignes"] == Decimal("0.75")
+    assert result.par_champ["total_ht"] == Decimal("1")
+
+
+def test_tolerance_proportionnelle_au_nombre_de_lignes() -> None:
+    """L'arrondi au centime par ligne est absorbé (tolérance × nombre de lignes)."""
+    # 3 × 333.33 = 999.99, écart de 0.01 sur total_ht 1000 → cohérent.
+    result = compute_confidence(_facture(lignes=_lignes("333.33", "333.33", "333.33")))
+    assert result.par_champ["lignes"] == Decimal("1")
+
+
+def test_malus_ne_produit_jamais_zero() -> None:
+    """Extraction catastrophique + malus confirmé → score plancher, jamais 0.
+
+    Le 0 reste le sentinelle de l'orchestrateur : le malus, multiplicatif et
+    appliqué avant ``max(raw, _FLOOR)``, ne peut pas le produire.
+    """
+    lignes = [
+        {
+            "designation": "",
+            "quantite": 1,
+            "prix_unitaire_ht": Decimal("999.00"),
+            "taux_tva": Decimal("17.00"),
+        }
+    ]
+    result = compute_confidence(
+        _facture(
+            siret_emetteur=None,
+            siret_destinataire=None,
+            numero_facture=None,
+            date_emission=None,
+            iban=None,
+            total_ht=Decimal("100.00"),
+            total_tva=Decimal("20.00"),
+            total_ttc=Decimal("120.00"),  # triplet cohérent → malus confirmé
+            lignes=lignes,
+        )
+    )
+
+    assert result.score_global >= _FLOOR
+    assert result.score_global > Decimal("0")
+    assert result.score_global <= _CROSS_CHECK_PENALTY
 
 
 # --- Extraction inexploitable (jamais 0) -----------------------------------

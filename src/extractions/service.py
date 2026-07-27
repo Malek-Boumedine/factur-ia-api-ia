@@ -149,6 +149,17 @@ def run_extraction_pipeline(
         )
 
         facture = structured["facture"]
+
+        # Diagnostic : la sortie structurée du LLM, AVANT coercition/validation —
+        # permet de voir si un champ manquant vient du modèle ou de l'aval. DEBUG
+        # uniquement (silencieux par défaut) ; on ne journalise que la sortie
+        # structurée, jamais le texte brut du document.
+        logger.debug(
+            "Document %s — JSON structuré (avant validation) : %s",
+            id_document,
+            facture,
+        )
+
         confidence = compute_confidence(facture)
         payload = validate_extraction(id_document, facture, confidence.score_global)
         logger.info(

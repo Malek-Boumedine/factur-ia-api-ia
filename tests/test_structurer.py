@@ -226,6 +226,22 @@ def test_structure_invoice_separates_type_from_contract(
     assert set(result) == {"type_document", "facture"}
 
 
+def test_system_prompt_teaches_french_amount_reading() -> None:
+    # Anti-régression (bug constaté : « 1 850,00 » extrait 850.0) : le prompt doit
+    # garder les consignes de LECTURE du format français des montants — espace =
+    # séparateur de milliers à agréger, virgule = séparateur décimal — avec les
+    # exemples concrets et l'avertissement sur la troncature avant un espace.
+    # Espaces normalisés : le prompt est replié à 88 colonnes, un exemple peut
+    # être coupé par un retour à la ligne.
+    prompt = " ".join(SYSTEM_PROMPT.split())
+    assert "séparateur de milliers" in prompt
+    assert "séparateur décimal" in prompt
+    assert "« 1 850,00 » vaut `1850.00`" in prompt
+    assert "« 12 345,67 » vaut `12345.67`" in prompt
+    assert "« 850,00 » vaut `850.00`" in prompt
+    assert "Ne tronque JAMAIS" in prompt
+
+
 def test_structuration_schema_constrains_type_document() -> None:
     # Le schéma LLM ajoute type_document à plat, dans required, avec l'enum complet.
     schema = INVOICE_JSON_SCHEMA["json_schema"]["schema"]
