@@ -18,9 +18,13 @@ def _configure_logging() -> None:
     recours de Python), sans horodatage ni nom de logger — diagnostic impossible
     en production. ``basicConfig`` est sans effet si le logger racine a déjà des
     handlers (configuration posée par le déployeur) : on n'écrase rien.
+
+    Niveau : ``INFO`` par défaut, ``DEBUG`` si ``settings.DEBUG`` est actif —
+    active les logs de diagnostic du pipeline (ex. JSON structuré avant
+    validation). Dev uniquement.
     """
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.DEBUG if settings.DEBUG else logging.INFO,
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     )
 

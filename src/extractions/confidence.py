@@ -6,7 +6,8 @@ faire confiance** à chaque champ, puis on agrège en un score global.
 
 Approche retenue : **heuristiques déterministes pures**, sans appel LLM. On mesure
 la *validité* et la *cohérence interne* des champs (clé de Luhn du SIRET, mod-97 de
-l'IBAN, égalité ``HT + TVA = TTC``, taux de TVA légaux, date ISO plausible), pas
+l'IBAN, égalité ``HT + TVA = TTC``, somme des lignes recoupée avec le total HT,
+taux de TVA légaux, date ISO plausible), pas
 leur *fidélité à la source* — un SIRET bien formé peut rester le mauvais numéro.
 C'est le plafond assumé de l'approche, et la raison d'être de la relecture humaine
 (human-in-the-loop). Avantage : objectif, reproductible, testable, explicable — un
@@ -56,6 +57,16 @@ _MALFORMED = Decimal("0.2")
 
 # Précision de restitution du score global.
 _QUANTUM = Decimal("0.0001")
+
+# Malus multiplicatif du score global quand l'incohérence croisée « somme des
+# lignes ≠ total HT » est CONFIRMÉE par un triplet HT+TVA=TTC cohérent : les
+# totaux se corroborent entre eux, donc un montant de ligne est très probablement
+# faux. Le multiplicateur borne le score final à 0.6, sous le seuil d'alerte,
+# quel que soit le reste de l'extraction — une erreur monétaire prouvée doit être
+# perceptible sur le seul score transmis au callback. Une incohérence NON
+# confirmée (triplet invérifiable, coupable indésignable) ne déclenche que les
+# plafonds par champ, jamais ce malus.
+_CROSS_CHECK_PENALTY = Decimal("0.6")
 
 # --- Constantes de validation ----------------------------------------------
 
@@ -206,6 +217,31 @@ def _coherence(
     return abs((ht + tva) - ttc) <= _AMOUNT_TOLERANCE
 
 
+def _lines_coherence(lignes: Any, ht: Decimal | None) -> bool | None:
+    """Cohérence croisée « somme des ``quantite × prix_unitaire_ht`` = total HT ».
+
+    Renvoie ``None`` si le contrôle est impossible : pas de lignes, ``total_ht``
+    absent/non numérique, ou une ligne dont la quantité ou le prix n'est pas
+    convertible — une somme partielle produirait une fausse incohérence, on
+    s'abstient. La tolérance est proportionnelle au nombre de lignes (chaque ligne
+    peut porter son propre arrondi au centime).
+    """
+    if ht is None or not isinstance(lignes, list) or not lignes:
+        return None
+
+    lines_sum = Decimal("0")
+    for line in lignes:
+        if not isinstance(line, dict):
+            return None
+        quantite = _as_decimal(line.get("quantite"))
+        prix = _as_decimal(line.get("prix_unitaire_ht"))
+        if quantite is None or prix is None:
+            return None
+        lines_sum += quantite * prix
+
+    return abs(lines_sum - ht) <= _AMOUNT_TOLERANCE * len(lignes)
+
+
 def _score_total(value: Decimal | None, coherent: bool | None) -> Decimal:
     """Confiance d'un total, modulée par la cohérence croisée des trois totaux.
 
@@ -222,11 +258,19 @@ def _score_total(value: Decimal | None, coherent: bool | None) -> Decimal:
     return _UNVERIFIED_PRESENT  # présent mais non recoupable (autres totaux absents)
 
 
-def _score_lignes(value: Any) -> Decimal:
-    """Confiance des lignes : moyenne de la validité structurelle de chaque ligne.
+def _score_lignes(value: Any, coherent: bool | None) -> Decimal:
+    """Confiance des lignes : validité structurelle, plafonnée par la cohérence croisée.
 
-    Par ligne, quatre contrôles : désignation non vide, quantité > 0, prix unitaire
-    présent et ≥ 0, taux de TVA parmi les taux légaux. Liste vide/absente → 0.
+    Score de base : moyenne, par ligne, de quatre contrôles (désignation non vide,
+    quantité > 0, prix unitaire présent et ≥ 0, taux de TVA parmi les taux légaux).
+    Liste vide/absente → 0.
+
+    Comme ``_score_total``, le résultat est ensuite modulé par la cohérence croisée
+    (ici « somme des lignes = total HT », cf. ``_lines_coherence``) : incohérente →
+    plafond ``_INTEGRITY_FAILED``, des lignes structurellement parfaites dont un
+    montant est faux doivent attirer la relecture. Cohérente ou invérifiable →
+    score structurel inchangé — pas de bonus, la cohérence de somme ne doit pas
+    masquer un taux illégal ou une désignation vide.
     """
     if not isinstance(value, list) or not value:
         return Decimal("0")
@@ -248,7 +292,10 @@ def _score_lignes(value: Any) -> Decimal:
         ]
         line_scores.append(Decimal(sum(checks)) / Decimal(len(checks)))
 
-    return sum(line_scores, Decimal("0")) / Decimal(len(line_scores))
+    structural = sum(line_scores, Decimal("0")) / Decimal(len(line_scores))
+    if coherent is False:
+        return min(structural, _INTEGRITY_FAILED)
+    return structural
 
 
 # --- Agrégation ------------------------------------------------------------
@@ -273,8 +320,10 @@ def compute_confidence(facture: dict[str, Any]) -> ConfidenceResult:
     ``facture`` (issu de ``structurer.py``, montants en ``Decimal``), puis agrège en
     une moyenne pondérée : les champs critiques absents sont comptés (confiance 0),
     les non-critiques absents sont exclus de la moyenne mais restent signalés à 0
-    dans ``par_champ``. Le résultat est plafonné par le bas à ``_FLOOR`` : il ne vaut
-    **jamais 0** (sentinelle « inexploitable » réservée à l'orchestrateur).
+    dans ``par_champ``. Une incohérence croisée « somme des lignes ≠ total HT »
+    confirmée par un triplet cohérent applique en plus le malus global
+    ``_CROSS_CHECK_PENALTY``. Le résultat est plafonné par le bas à ``_FLOOR`` : il
+    ne vaut **jamais 0** (sentinelle « inexploitable » réservée à l'orchestrateur).
 
     Args:
         facture: sous-ensemble « données extraites » (miroir d'``OcrWebhookPayload``
@@ -288,6 +337,7 @@ def compute_confidence(facture: dict[str, Any]) -> ConfidenceResult:
     tva = _as_decimal(facture.get("total_tva"))
     ttc = _as_decimal(facture.get("total_ttc"))
     coherent = _coherence(ht, tva, ttc)
+    lines_coherent = _lines_coherence(facture.get("lignes"), ht)
 
     par_champ: dict[str, Decimal] = {
         "siret_emetteur": _score_siret(facture.get("siret_emetteur")),
@@ -298,8 +348,15 @@ def compute_confidence(facture: dict[str, Any]) -> ConfidenceResult:
         "total_tva": _score_total(tva, coherent),
         "total_ttc": _score_total(ttc, coherent),
         "iban": _score_iban(facture.get("iban")),
-        "lignes": _score_lignes(facture.get("lignes")),
+        "lignes": _score_lignes(facture.get("lignes"), lines_coherent),
     }
+
+    # Incohérence lignes/total NON confirmée (triplet invérifiable) : le contrôle
+    # croisé ne désigne pas de coupable — le total HT est plafonné comme les
+    # lignes. Quand le triplet est cohérent, les totaux se corroborent entre eux
+    # et gardent leur confiance : seules les lignes payent (+ malus global).
+    if lines_coherent is False and coherent is None:
+        par_champ["total_ht"] = min(par_champ["total_ht"], _INTEGRITY_FAILED)
 
     weighted_sum = Decimal("0")
     weight_total = Decimal("0")
@@ -310,6 +367,12 @@ def compute_confidence(facture: dict[str, Any]) -> ConfidenceResult:
         weight_total += weight
 
     raw = weighted_sum / weight_total if weight_total > 0 else _FLOOR
+    # Incohérence CONFIRMÉE (triplet cohérent : un montant de ligne est faux) :
+    # malus multiplicatif — l'erreur monétaire doit rester perceptible sur le seul
+    # score transmis au callback. Appliqué avant plancher et quantification :
+    # l'invariant (0, 1] et le jamais-zéro tiennent.
+    if lines_coherent is False and coherent is True:
+        raw *= _CROSS_CHECK_PENALTY
     score_global = max(raw, _FLOOR).quantize(_QUANTUM)
 
     return ConfidenceResult(score_global=score_global, par_champ=par_champ)
