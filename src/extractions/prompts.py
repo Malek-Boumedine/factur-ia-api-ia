@@ -23,11 +23,19 @@ champs listés dans ``required``, ``additionalProperties: false`` sur chaque obj
 et champs optionnels exprimés par une union avec ``null`` (``["string", "null"]``).
 
 Le schéma effectivement envoyé au LLM (``INVOICE_JSON_SCHEMA``) ajoute au miroir du
-contrat un champ ``type_document`` (suggestion de classification devis/facture/avoir/
-inconnu), produit dans le même appel LLM puis séparé du sous-ensemble « données
-extraites » côté ``structurer.py``. Il rejoint le contrat plus loin dans le
-pipeline, via le champ optionnel ``type_document`` d'``OcrWebhookPayload``. Le
-miroir pur du sous-ensemble « données extraites » reste ``_INVOICE_SCHEMA``.
+contrat deux champs hors contrat, produits dans le même appel LLM puis séparés du
+sous-ensemble « données extraites » côté ``structurer.py`` :
+
+- ``type_document`` (suggestion de classification devis/facture/avoir/inconnu), qui
+  rejoint le contrat plus loin dans le pipeline via le champ optionnel
+  ``type_document`` d'``OcrWebhookPayload`` ;
+- ``delai_paiement_jours`` (échéance exprimée en délai — « net 30 », « paiement à
+  30 jours »), qui ne rejoint jamais le contrat : ``structurer.py`` le consomme pour
+  dériver ``date_echeance`` (émission + délai) quand aucune date d'échéance absolue
+  n'a été lue. L'arithmétique est faite en Python, pas par le modèle : déterministe
+  et testable.
+
+Le miroir pur du sous-ensemble « données extraites » reste ``_INVOICE_SCHEMA``.
 """
 
 from enum import StrEnum
@@ -78,7 +86,28 @@ Règles impératives :
   `prix_unitaire_ht`) : nombres décimaux avec le point comme séparateur décimal,
   sans séparateur de milliers, sans symbole monétaire ni texte (écris `1850.00`,
   pas `1 850,00 €`).
-- `date_emission` est au format ISO `AAAA-MM-JJ` (par exemple `2026-07-06`).
+- `date_emission` et `date_echeance` sont au format ISO `AAAA-MM-JJ` (par exemple
+  `2026-07-06`). Le document, lui, utilise les formats français : convertis-les
+  (« 06/07/2026 » et « 06-07-2026 » valent `2026-07-06` ; « 6 juillet 2026 » vaut
+  `2026-07-06` ; « 15 mars 2026 » vaut `2026-03-15`). Dans une date française en
+  chiffres, le JOUR précède le MOIS : « 03/04/2026 » est le 3 avril 2026, jamais le
+  4 mars.
+- NE CONFONDS PAS les deux dates :
+  - `date_emission` est la date à laquelle la facture est établie (« date »,
+    « date de facture », « émise le », « fait le », « le … »).
+  - `date_echeance` est la DATE LIMITE DE PAIEMENT (« échéance », « date
+    d'échéance », « à régler avant le … », « payable avant le … », « à payer au
+    plus tard le … », « date limite de paiement »). Elle est postérieure ou égale
+    à la date d'émission.
+  Si le document ne porte qu'une seule date, c'est la date d'émission : mets
+  `date_echeance` à `null`. Ne recopie JAMAIS la date d'émission dans
+  `date_echeance`.
+- `delai_paiement_jours` : quand l'échéance est exprimée en DÉLAI et non en date
+  (« paiement à 30 jours », « net 30 », « règlement sous 45 jours », « payable à
+  60 jours »), mets ici le NOMBRE DE JOURS (`30`, `45`, `60`) ; sinon `null`. Ne
+  calcule pas la date toi-même, le délai est converti en date en aval. Si le
+  document porte une date d'échéance explicite, renseigne `date_echeance` — et
+  aussi `delai_paiement_jours` si le délai est écrit à côté.
 - Distingue bien l'ÉMETTEUR du DESTINATAIRE : `siret_emetteur` est le SIRET du
   vendeur / prestataire qui émet la facture ; `siret_destinataire` est le SIRET du
   client facturé. Ne les intervertis pas.
@@ -124,6 +153,7 @@ _INVOICE_SCHEMA: dict[str, Any] = {
         "siret_destinataire": {"type": ["string", "null"]},
         "numero_facture": {"type": ["string", "null"]},
         "date_emission": {"type": ["string", "null"]},  # ISO AAAA-MM-JJ
+        "date_echeance": {"type": ["string", "null"]},  # ISO AAAA-MM-JJ
         "total_ht": {"type": ["number", "null"]},
         "total_tva": {"type": ["number", "null"]},
         "total_ttc": {"type": ["number", "null"]},
@@ -135,6 +165,7 @@ _INVOICE_SCHEMA: dict[str, Any] = {
         "siret_destinataire",
         "numero_facture",
         "date_emission",
+        "date_echeance",
         "total_ht",
         "total_tva",
         "total_ttc",
@@ -144,11 +175,13 @@ _INVOICE_SCHEMA: dict[str, Any] = {
 }
 
 # Schéma effectivement envoyé au LLM : miroir du contrat (``_INVOICE_SCHEMA``)
-# augmenté, à plat, du champ ``type_document`` (suggestion de classification hors
-# contrat). Un schéma plat est plus fiable pour le modèle qu'une imbrication ; la
-# séparation type_document / sous-ensemble contrat est faite côté ``structurer.py``
-# après réception. ``enum`` sur une chaîne est supporté en mode strict et garantit
-# une des valeurs de ``TypeDocument`` (source unique des valeurs autorisées).
+# augmenté, à plat, des deux champs hors contrat — ``type_document`` (suggestion de
+# classification) et ``delai_paiement_jours`` (échéance exprimée en délai, convertie
+# en date côté Python). Un schéma plat est plus fiable pour le modèle qu'une
+# imbrication ; la séparation hors-contrat / sous-ensemble contrat est faite côté
+# ``structurer.py`` après réception. ``enum`` sur une chaîne est supporté en mode
+# strict et garantit une des valeurs de ``TypeDocument`` (source unique des valeurs
+# autorisées).
 _STRUCTURATION_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
@@ -158,8 +191,13 @@ _STRUCTURATION_SCHEMA: dict[str, Any] = {
             "type": "string",
             "enum": [type_doc.value for type_doc in TypeDocument],
         },
+        "delai_paiement_jours": {"type": ["integer", "null"]},
     },
-    "required": [*_INVOICE_SCHEMA["required"], "type_document"],
+    "required": [
+        *_INVOICE_SCHEMA["required"],
+        "type_document",
+        "delai_paiement_jours",
+    ],
 }
 
 # ``response_format`` complet à passer à ``call_llm`` (structured outputs strict).

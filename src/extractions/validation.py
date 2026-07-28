@@ -45,6 +45,10 @@ from src.extractions.prompts import TypeDocument
 # Totaux non-nullables au contrat mais nullables côté LLM : la divergence à résoudre.
 _TOTAL_FIELDS = ("total_ht", "total_tva", "total_ttc")
 
+# Champs date du contrat : nullables, ramenés à ``None`` si le modèle a renvoyé une
+# chaîne non ISO (on ne fait pas échouer tout le payload pour une date illisible).
+_DATE_FIELDS = ("date_emission", "date_echeance")
+
 
 class PayloadValidationError(Exception):
     """Le JSON structuré ne construit pas un ``OcrWebhookPayload`` valide.
@@ -106,8 +110,9 @@ def _prepare(facture: dict[str, Any]) -> dict[str, Any]:
     """Coerce le ``dict`` LLM vers le contrat, sans jeter l'extraction.
 
     - totaux ``null`` (ou absents) → ``Decimal("0")`` (divergence LLM/contrat) ;
-    - ``date_emission`` présente mais non parsable → ``None`` (champ nullable au
-      contrat : on ne fait pas échouer tout le payload pour une date illisible).
+    - date (``date_emission``, ``date_echeance``) présente mais non parsable →
+      ``None`` (champs nullables au contrat : on ne fait pas échouer tout le payload
+      pour une date illisible).
 
     Les autres champs (SIRET, numéro, IBAN, lignes) sont laissés tels quels : Pydantic
     les valide et coerce en aval.
@@ -118,9 +123,10 @@ def _prepare(facture: dict[str, Any]) -> dict[str, Any]:
         if prepared.get(field) is None:
             prepared[field] = Decimal("0")
 
-    date_value = prepared.get("date_emission")
-    if isinstance(date_value, str) and not _is_iso_date(date_value):
-        prepared["date_emission"] = None
+    for field in _DATE_FIELDS:
+        date_value = prepared.get(field)
+        if isinstance(date_value, str) and not _is_iso_date(date_value):
+            prepared[field] = None
 
     return prepared
 

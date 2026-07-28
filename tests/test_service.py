@@ -12,6 +12,7 @@ réseau) restent réels : le payload produit est donc validé de bout en bout co
 le contrat ``OcrWebhookPayload``.
 """
 
+from datetime import date
 from decimal import Decimal
 from typing import Any
 
@@ -36,6 +37,7 @@ def _facture() -> dict[str, Any]:
         "siret_destinataire": "98765432100022",
         "numero_facture": "FA-2026-042",
         "date_emission": "2026-07-06",
+        "date_echeance": "2026-08-05",
         "total_ht": Decimal("1000.00"),
         "total_tva": Decimal("200.00"),
         "total_ttc": Decimal("1200.00"),
@@ -158,6 +160,9 @@ def test_final_payload_is_correct(
     assert payload.total_tva == Decimal("200.00")
     assert payload.total_ttc == Decimal("1200.00")
     assert payload.numero_facture == "FA-2026-042"
+    # Les deux dates traversent le pipeline sans se confondre ni se perdre.
+    assert payload.date_emission == date(2026, 7, 6)
+    assert payload.date_echeance == date(2026, 8, 5)
     assert len(payload.lignes) == 1
     assert payload.lignes[0].designation == "Prestation de conseil"
 
@@ -178,6 +183,7 @@ def test_final_payload_carries_type_and_par_champ(
         "siret_destinataire",
         "numero_facture",
         "date_emission",
+        "date_echeance",
         "total_ht",
         "total_tva",
         "total_ttc",

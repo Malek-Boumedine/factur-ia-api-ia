@@ -7,7 +7,7 @@ faire confiance** à chaque champ, puis on agrège en un score global.
 Approche retenue : **heuristiques déterministes pures**, sans appel LLM. On mesure
 la *validité* et la *cohérence interne* des champs (clé de Luhn du SIRET, mod-97 de
 l'IBAN, égalité ``HT + TVA = TTC``, somme des lignes recoupée avec le total HT,
-taux de TVA légaux, date ISO plausible), pas
+taux de TVA légaux, dates ISO plausibles, échéance postérieure à l'émission), pas
 leur *fidélité à la source* — un SIRET bien formé peut rester le mauvais numéro.
 C'est le plafond assumé de l'approche, et la raison d'être de la relecture humaine
 (human-in-the-loop). Avantage : objectif, reproductible, testable, explicable — un
@@ -31,7 +31,7 @@ même catastrophique. Aucune collision possible avec le sentinelle.
 """
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -83,6 +83,14 @@ _LEGAL_VAT_RATES = frozenset(
 # Borne basse de plausibilité d'une date d'émission (bornage haut = aujourd'hui).
 _MIN_PLAUSIBLE_DATE = date(2000, 1, 1)
 
+# Horizon futur admis pour une date d'échéance. Contrairement à la date d'émission
+# (jamais future), une échéance est normalement À VENIR : la borner à aujourd'hui
+# pénaliserait toutes les factures encore à payer. Au-delà de deux ans en revanche,
+# une erreur de lecture est bien plus probable qu'un vrai terme de paiement. La
+# borne basse reste ``_MIN_PLAUSIBLE_DATE`` : une facture ancienne déposée
+# tardivement a une échéance déjà passée, ce qui est parfaitement légitime.
+_MAX_ECHEANCE_HORIZON = timedelta(days=730)
+
 # --- Pondération et criticité des champs -----------------------------------
 
 # Poids relatifs dans la moyenne pondérée du score global. Les champs critiques
@@ -95,6 +103,9 @@ _FIELD_WEIGHTS: dict[str, Decimal] = {
     "siret_destinataire": Decimal("1"),
     "numero_facture": Decimal("2"),
     "date_emission": Decimal("2"),
+    # Moins lourde que la date d'émission : souvent absente des factures (paiement
+    # comptant), et jamais bloquante côté API data où elle reste éditable.
+    "date_echeance": Decimal("1"),
     "iban": Decimal("1"),
     "lignes": Decimal("2"),
 }
@@ -187,17 +198,57 @@ def _score_iban(value: Any) -> Decimal:
     return Decimal("1") if _iban_mod97_ok(value) else _INTEGRITY_FAILED
 
 
+def _parse_iso(value: Any) -> date | None:
+    """Parse une date ISO (``AAAA-MM-JJ``), ou ``None`` si absente/non parsable."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        return None
+
+
 def _score_date(value: Any) -> Decimal:
     """Confiance d'une date d'émission : ISO parsable + plausible."""
     if not isinstance(value, str) or not value.strip():
         return Decimal("0")
-    try:
-        parsed = date.fromisoformat(value)
-    except ValueError:
+    parsed = _parse_iso(value)
+    if parsed is None:
         return _MALFORMED  # présente mais non parsable
     if _MIN_PLAUSIBLE_DATE <= parsed <= date.today():
         return Decimal("1")
     return Decimal("0.5")  # parsable mais hors plage plausible (futur, trop ancienne)
+
+
+def _score_echeance(value: Any, date_emission: Any) -> Decimal:
+    """Confiance d'une échéance : ISO parsable, postérieure à l'émission, plausible.
+
+    Scorer distinct de ``_score_date`` sur deux points, parce qu'une échéance n'obéit
+    pas aux mêmes règles qu'une date d'émission :
+
+    - la plage plausible s'étend dans le FUTUR (``_MAX_ECHEANCE_HORIZON``) : une
+      facture non encore échue est le cas normal, pas une anomalie ;
+    - une échéance ANTÉRIEURE à l'émission est incohérente (on ne paye pas une
+      facture avant qu'elle existe) — signal typique d'une inversion des deux dates,
+      exactement le défaut d'extraction qu'on cherche à rendre visible. Contrôle
+      croisé du même esprit que ``HT + TVA = TTC`` : il n'est fait que si la date
+      d'émission est elle-même lisible.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return Decimal("0")
+    parsed = _parse_iso(value)
+    if parsed is None:
+        return _MALFORMED  # présente mais non parsable
+
+    # Échéance avant émission : les deux dates sont probablement inversées.
+    emission = _parse_iso(date_emission)
+    if emission is not None and parsed < emission:
+        return _INTEGRITY_FAILED
+
+    if _MIN_PLAUSIBLE_DATE <= parsed <= date.today() + _MAX_ECHEANCE_HORIZON:
+        return Decimal("1")
+    # Parsable mais hors plage plausible (trop lointaine, ou antérieure à 2000).
+    return Decimal("0.5")
 
 
 def _score_text(value: Any) -> Decimal:
@@ -348,6 +399,9 @@ def compute_confidence(facture: dict[str, Any]) -> ConfidenceResult:
         "siret_destinataire": _score_siret(facture.get("siret_destinataire")),
         "numero_facture": _score_text(facture.get("numero_facture")),
         "date_emission": _score_date(facture.get("date_emission")),
+        "date_echeance": _score_echeance(
+            facture.get("date_echeance"), facture.get("date_emission")
+        ),
         "total_ht": _score_total(ht, coherent),
         "total_tva": _score_total(tva, coherent),
         "total_ttc": _score_total(ttc, coherent),

@@ -150,6 +150,26 @@ def test_date_illisible_ramenee_a_none() -> None:
     assert payload.score_confiance == _SCORE
 
 
+def test_date_echeance_propagee_au_payload() -> None:
+    """L'échéance extraite arrive bien au contrat (elle part au callback API data)."""
+    payload = validate_extraction(_ID, _facture(date_echeance="2026-02-15"), _SCORE)
+    assert payload.date_echeance == date(2026, 2, 15)
+    assert payload.date_emission == date(2026, 1, 15)  # les deux dates cohabitent
+
+
+def test_date_echeance_illisible_ramenee_a_none() -> None:
+    """Échéance non parsable : ramenée à None, comme la date d'émission."""
+    payload = validate_extraction(_ID, _facture(date_echeance="15/02/2026"), _SCORE)
+    assert payload.date_echeance is None
+    assert payload.score_confiance == _SCORE
+
+
+def test_date_echeance_absente_reste_none() -> None:
+    """Facture sans échéance : champ optionnel à None, payload valide (additif)."""
+    payload = validate_extraction(_ID, _facture(), _SCORE)
+    assert payload.date_echeance is None
+
+
 # --- Lignes vides ----------------------------------------------------------
 
 

@@ -19,6 +19,10 @@ class OcrWebhookPayload(BaseModel):
     siret_destinataire: str | None = None
     numero_facture: str | None = None
     date_emission: date | None = None
+    # Extension additive du contrat : date limite de paiement, lue sur le document
+    # ou dérivée d'un délai (« net 30 ») côté structuration. ``None`` si absente ou
+    # illisible — une API data qui ne connaît pas encore ce champ l'ignore.
+    date_echeance: date | None = None
     total_ht: Decimal
     total_tva: Decimal
     total_ttc: Decimal
