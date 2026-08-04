@@ -16,6 +16,14 @@ dependencies = [
     "easyocr>=1.7",
     "groq>=0.15",
     "pymupdf>=1.28.0",
+    # Client de tracking MLflow seul (monitoring de la qualité d'extraction) :
+    # le paquet `mlflow` complet embarque le serveur et tire pandas, numpy,
+    # scikit-learn et Flask — inutiles pour écrire des métriques.
+    "mlflow-skinny>=3.0",
+    # Backend de tracking local SQLite : `mlflow-skinny` embarque le store et ses
+    # migrations mais ne déclare pas ces deux dépendances, à fournir nous-mêmes.
+    "sqlalchemy>=2.0",
+    "alembic>=1.13",
 ]
 
 [dependency-groups]
@@ -26,6 +34,9 @@ dev = [
     "detect-secrets>=1.5",
     "pre-commit>=4.0",
     "python-semantic-release>=9.15",
+    # MLflow complet : uniquement pour l'interface de restitution locale
+    # (`uv run mlflow ui`). Le service, lui, n'a besoin que de `mlflow-skinny`.
+    "mlflow>=3.0",
 ]
 test = [
     "pytest>=8.3",

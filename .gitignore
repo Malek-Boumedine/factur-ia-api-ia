@@ -227,6 +227,12 @@ todo*
 local_ci.sh
 /uploads
 
+# monitoring MLflow : store local des métriques de qualité d'extraction
+mlflow.db
+mlflow.db-journal
+/mlruns/
+/mlartifacts/
+
 # Claude Code
 .claude/
 CLAUDE.md

@@ -5,6 +5,7 @@ tâche de fond (``fastapi.BackgroundTasks``) après le ``202`` de l'endpoint :
 
     routage extraction → texte brut → structuration LLM → score de confiance
     → validation contrat → ``OcrWebhookPayload`` → envoi au callback OCR
+    → traçage de la qualité (monitoring)
 
 Le module est **synchrone** à dessein : les briques lourdes (``pdfplumber``,
 EasyOCR, client Groq) sont bloquantes. Lancé via ``BackgroundTasks``, il tourne
@@ -29,12 +30,19 @@ pour toujours côté API data. Le payload — succès **ou** échec — est ensu
 POSTé au callback OCR de l'API data (retries gérés par ``callback.client``) ;
 un envoi échoué, quelle qu'en soit la cause, est seulement journalisé, le
 payload est perdu (limite assumée du choix ``BackgroundTasks``, cf. CLAUDE.md).
+
+Dernière étape, hors fonctionnel : le traçage de la qualité de l'extraction
+(``core/monitoring.py``), placé **après** l'envoi au callback pour qu'il ne
+retarde jamais ce qui compte, et neutre par construction — il ne lève pas et ne
+fait rien tant que le monitoring n'est pas activé.
 """
 
 import logging
+import time
 
 from src.callback.client import CallbackError, send_callback
 from src.callback.schemas import OcrWebhookPayload
+from src.core.monitoring import ModeExtraction, track_extraction_quality
 from src.extractions.confidence import compute_confidence
 from src.extractions.llm_client import LlmClientError
 from src.extractions.ocr_extractor import OcrExtractionError, extract_ocr_text
@@ -70,31 +78,54 @@ _EXTRACTION_FAILURES = (
 )
 
 
-def _extract_text(content: bytes, content_type: str) -> str:
-    """Extrait le texte brut selon le type de document (routage des trois chemins).
+def _detect_mode(content: bytes, content_type: str) -> ModeExtraction:
+    """Détermine par quel chemin le texte va être extrait (routage).
 
-    Une image va directement à l'OCR (pas de détection). Un PDF passe par
-    ``detect_pdf_type`` puis, selon sa nature, l'extraction native ou l'OCR.
+    Une image va directement à l'OCR, sans passer par le détecteur PDF. Un PDF
+    passe par ``detect_pdf_type``, qui décide entre extraction native et OCR.
+
+    Décider du chemin *avant* de l'emprunter permet de connaître le mode même
+    quand l'extraction échoue ensuite — un échec OCR reste attribué à l'OCR,
+    c'est justement le signal intéressant pour le monitoring.
 
     Args:
         content: contenu binaire du fichier reçu.
         content_type: type MIME validé en amont (PDF, JPEG ou PNG).
 
     Returns:
+        Le mode d'extraction retenu (jamais ``INCONNU`` : ne pas savoir se
+        traduit ici par une ``PdfDetectionError``).
+
+    Raises:
+        PdfDetectionError: PDF illisible par le détecteur.
+    """
+    if content_type != _PDF_MIME_TYPE:
+        return ModeExtraction.OCR
+
+    if detect_pdf_type(content) is PdfType.NATIVE:
+        return ModeExtraction.PDF_NATIF
+    return ModeExtraction.OCR
+
+
+def _extract_text(content: bytes, content_type: str, mode: ModeExtraction) -> str:
+    """Extrait le texte brut par le chemin déjà choisi par ``_detect_mode``.
+
+    Args:
+        content: contenu binaire du fichier reçu.
+        content_type: type MIME validé en amont — distingue, en mode OCR, le PDF
+            scanné (à rasteriser) de l'image déjà exploitable telle quelle.
+        mode: chemin d'extraction retenu.
+
+    Returns:
         Le texte brut extrait, prêt pour la structuration LLM.
 
     Raises:
-        PdfDetectionError | PdfExtractionError | OcrExtractionError: document
-            illisible ou sans texte exploitable (traduit en échec par l'appelant).
+        PdfExtractionError | OcrExtractionError: document illisible ou sans
+            texte exploitable (traduit en échec par l'appelant).
     """
-    if content_type != _PDF_MIME_TYPE:
-        # Image (JPEG/PNG) : OCR direct, sans passer par le détecteur PDF.
-        return extract_ocr_text(content, is_pdf=False)
-
-    pdf_type = detect_pdf_type(content)
-    if pdf_type is PdfType.NATIVE:
+    if mode is ModeExtraction.PDF_NATIF:
         return extract_native_pdf_text(content)
-    return extract_ocr_text(content, is_pdf=True)
+    return extract_ocr_text(content, is_pdf=content_type == _PDF_MIME_TYPE)
 
 
 def run_extraction_pipeline(
@@ -118,6 +149,10 @@ def run_extraction_pipeline(
     est journalisé puis avalé : le payload est perdu, limite assumée du choix
     ``BackgroundTasks`` (cf. CLAUDE.md).
 
+    La qualité de l'extraction (score, taux de champs reconnus, confiance par
+    champ, mode d'extraction, durée) est enfin tracée pour le monitoring, une
+    fois le callback envoyé — sans effet si le monitoring est désactivé.
+
     Args:
         content: contenu binaire du fichier reçu (lu avant le ``202`` dans le
             router, car l'``UploadFile`` peut être fermé quand la tâche s'exécute).
@@ -136,8 +171,15 @@ def run_extraction_pipeline(
         content_type,
     )
 
+    # Horloge monotone : mesure une durée, insensible aux changements d'heure
+    # système. Le mode reste ``INCONNU`` si la détection elle-même échoue — on
+    # ne saurait pas honnêtement dire par quel chemin on serait passé.
+    debut = time.monotonic()
+    mode = ModeExtraction.INCONNU
+
     try:
-        raw_text = _extract_text(content, content_type)
+        mode = _detect_mode(content, content_type)
+        raw_text = _extract_text(content, content_type, mode)
         structured = structure_invoice(raw_text)
 
         # ``type_document`` est une suggestion IA non contraignante, transmise au
@@ -216,5 +258,16 @@ def run_extraction_pipeline(
             id_document,
             exc_info=True,
         )
+
+    # Traçage de la qualité, en tout dernier : le callback est déjà parti, donc
+    # rien de fonctionnel n'attend cet appel. Succès comme échec sont tracés (un
+    # échec est le signal le plus intéressant à suivre dans le temps). L'appel
+    # est sans effet tant que le monitoring n'est pas activé, et ne lève jamais
+    # — la protection vit dans ``track_extraction_quality``, pas ici.
+    track_extraction_quality(
+        payload,
+        mode_extraction=mode,
+        duree_secondes=time.monotonic() - debut,
+    )
 
     return payload

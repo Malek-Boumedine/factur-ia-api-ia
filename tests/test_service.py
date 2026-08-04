@@ -14,15 +14,17 @@ le contrat ``OcrWebhookPayload``.
 
 from datetime import date
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
 import pytest
 from src.callback.client import CallbackError
 from src.callback.schemas import OcrWebhookPayload
 from src.core.config import settings
+from src.core.monitoring import ModeExtraction
 from src.extractions import service
 from src.extractions.ocr_extractor import OcrExtractionError
-from src.extractions.pdf_detector import PdfType
+from src.extractions.pdf_detector import PdfDetectionError, PdfType
 from src.extractions.prompts import TypeDocument
 from src.extractions.service import run_extraction_pipeline
 
@@ -334,3 +336,135 @@ def test_callback_error_does_not_crash_pipeline(
 
     assert payload.id_document == 42  # pas d'exception propagée
     assert "callback" in caplog.text
+
+
+# --- Traçage de la qualité (monitoring) ------------------------------------
+
+
+def test_qualite_tracee_apres_envoi_au_callback(
+    monkeypatch: pytest.MonkeyPatch, mock_structure: None
+) -> None:
+    """La qualité est tracée une fois, APRÈS le callback : le monitoring ne
+    retarde jamais ce qui est fonctionnel."""
+    monkeypatch.setattr(service, "extract_ocr_text", lambda content, *, is_pdf: "txt")
+
+    ordre: list[str] = []
+    traces: list[dict[str, Any]] = []
+
+    def _fake_send(payload: OcrWebhookPayload) -> None:
+        ordre.append("callback")
+
+    def _fake_track(payload: OcrWebhookPayload, **kwargs: Any) -> None:
+        ordre.append("tracage")
+        traces.append({"payload": payload, **kwargs})
+
+    monkeypatch.setattr(service, "send_callback", _fake_send)
+    monkeypatch.setattr(service, "track_extraction_quality", _fake_track)
+
+    payload = run_extraction_pipeline(b"image", 42, _PNG_MIME)
+
+    assert ordre == ["callback", "tracage"]
+    assert len(traces) == 1
+    assert traces[0]["payload"] is payload
+    assert traces[0]["duree_secondes"] >= 0
+
+
+@pytest.mark.parametrize(
+    ("content_type", "pdf_type", "mode_attendu"),
+    [
+        (_PNG_MIME, None, ModeExtraction.OCR),
+        (_PDF_MIME, PdfType.NATIVE, ModeExtraction.PDF_NATIF),
+        (_PDF_MIME, PdfType.SCANNED, ModeExtraction.OCR),
+    ],
+)
+def test_mode_extraction_trace_reflete_le_chemin(
+    monkeypatch: pytest.MonkeyPatch,
+    mock_structure: None,
+    content_type: str,
+    pdf_type: PdfType | None,
+    mode_attendu: ModeExtraction,
+) -> None:
+    """Le mode tracé correspond au chemin réellement emprunté.
+
+    C'est la dimension qui explique une dérive du score (« plus de documents
+    scannés arrivent ») : elle doit rester fidèle aux trois routages.
+    """
+    monkeypatch.setattr(service, "extract_ocr_text", lambda content, *, is_pdf: "txt")
+    monkeypatch.setattr(service, "extract_native_pdf_text", lambda content: "txt")
+    monkeypatch.setattr(service, "detect_pdf_type", lambda content: pdf_type)
+
+    traces: list[ModeExtraction] = []
+    monkeypatch.setattr(
+        service,
+        "track_extraction_quality",
+        lambda payload, *, mode_extraction, duree_secondes: traces.append(
+            mode_extraction
+        ),
+    )
+
+    run_extraction_pipeline(b"fichier", 42, content_type)
+
+    assert traces == [mode_attendu]
+
+
+def test_mode_inconnu_quand_la_detection_echoue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Détection du type de PDF en échec : on ne devine pas le chemin.
+
+    Le mode reste ``inconnu`` — on ne saurait honnêtement pas dire si le
+    document serait passé par l'extraction native ou par l'OCR.
+    """
+
+    def _raise(content: bytes) -> PdfType:
+        raise PdfDetectionError("PDF illisible")
+
+    monkeypatch.setattr(service, "detect_pdf_type", _raise)
+
+    traces: list[ModeExtraction] = []
+    monkeypatch.setattr(
+        service,
+        "track_extraction_quality",
+        lambda payload, *, mode_extraction, duree_secondes: traces.append(
+            mode_extraction
+        ),
+    )
+
+    payload = run_extraction_pipeline(b"pdf-corrompu", 55, _PDF_MIME)
+
+    assert payload.score_confiance == Decimal("0")  # échec, tracé quand même
+    assert traces == [ModeExtraction.INCONNU]
+
+
+def test_tracage_en_panne_ne_casse_pas_le_pipeline(
+    monkeypatch: pytest.MonkeyPatch,
+    mock_structure: None,
+    sent_payloads: list[OcrWebhookPayload],
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Monitoring RÉELLEMENT actif mais en panne : l'extraction aboutit quand même.
+
+    On ne mocke pas ``track_extraction_quality`` ici — on active le vrai
+    traçage et on casse MLflow dessous, pour vérifier la composition complète
+    (pipeline → monitoring → client MLflow) et pas seulement une promesse.
+    """
+    import mlflow
+
+    monkeypatch.setattr(service, "extract_ocr_text", lambda content, *, is_pdf: "txt")
+    monkeypatch.setattr(settings, "MLFLOW_ENABLED", True)
+    monkeypatch.setattr(
+        settings, "MLFLOW_TRACKING_URI", f"sqlite:///{tmp_path / 'mlflow.db'}"
+    )
+
+    def _boom(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("store MLflow injoignable")
+
+    monkeypatch.setattr(mlflow, "start_run", _boom)
+
+    with caplog.at_level("WARNING"):
+        payload = run_extraction_pipeline(b"image", 42, _PNG_MIME)
+
+    assert payload.score_confiance > 0  # l'extraction a bien abouti
+    assert sent_payloads == [payload]  # et le callback est parti
+    assert "traçage" in caplog.text  # l'incident est visible, sans plus

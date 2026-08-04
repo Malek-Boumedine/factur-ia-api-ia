@@ -5,6 +5,8 @@ Les variables sont lues depuis l'environnement (ou le fichier .env en local).
 échouer le démarrage — c'est voulu (fail-fast sur une config incomplète).
 """
 
+from decimal import Decimal
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -44,6 +46,22 @@ class Settings(BaseSettings):
 
     # --- CORS ---
     CORS_ORIGINS: str = "*"
+
+    # --- Monitoring de la qualité d'extraction (MLflow) ---
+    # Désactivé par défaut, comme les interrupteurs d'observabilité de l'API data :
+    # sans activation explicite, rien n'est tracé et ``mlflow`` n'est même pas
+    # importé (local et CI strictement inchangés). L'URI par défaut est un simple
+    # fichier SQLite local : aucun serveur n'est requis pour écrire, l'interface
+    # (``mlflow ui``) ne sert qu'à relire. Le store « répertoire de fichiers »
+    # (``file:./mlruns``) existe encore mais MLflow l'a placé en maintenance —
+    # SQLite est le backend local recommandé.
+    MLFLOW_ENABLED: bool = False
+    MLFLOW_TRACKING_URI: str = "sqlite:///mlflow.db"
+    MLFLOW_EXPERIMENT_NAME: str = "factur-ia-extraction"
+    # Score de confiance sous lequel une extraction est signalée comme dégradée
+    # (WARNING applicatif + tag ``alerte`` sur le run). Au-dessus de 0.6, borne
+    # haute imposée par le malus d'incohérence de ``confidence.py``.
+    MONITORING_SEUIL_ALERTE: Decimal = Decimal("0.7")
 
     @property
     def ocr_callback_url(self) -> str:
