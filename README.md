@@ -24,7 +24,7 @@ uv run pre-commit run --all-files             # lint + format
 
 ## Tests
 
-210 tests, 100 % de couverture de `src/`. La suite tourne en une dizaine de
+216 tests, 100 % de couverture de `src/`. La suite tourne en une dizaine de
 secondes, **sans réseau** : le LLM Groq, EasyOCR et le callback de l'API data
 sont toujours simulés, et une garde installée dans `tests/conftest.py` fait
 échouer tout test qui tenterait une connexion réelle. Les documents d'exemple
@@ -35,6 +35,71 @@ La **[stratégie de test](docs/strategie-de-test.md)** détaille, pour chaque é
 du pipeline, la partie visée, le périmètre, l'approche retenue et les limites
 connues — notamment l'absence de vérité terrain, qui interdit toute mesure du
 taux d'erreur d'extraction.
+
+## Sondes de disponibilité
+
+Deux routes destinées à la plateforme de déploiement : publiques (Cloud Run
+sonde sans en-tête d'authentification), mais **hors contrat OpenAPI** et sans
+aucune information exploitable dans les réponses — ni version, ni configuration,
+ni détail d'erreur.
+
+| Route | Rôle | Vérifie | Échec |
+| --- | --- | --- | --- |
+| `GET /health` | Liveness — le processus est-il vivant ? | rien | **redémarrage** du conteneur |
+| `GET /ready` | Readiness — cette instance peut-elle mener une extraction à bien ? | poids EasyOCR présents sur disque | **retrait du trafic**, sans redémarrage |
+
+`/health` répond 200 inconditionnellement, sans la moindre I/O : puisque son
+échec redémarre le conteneur, la faire dépendre d'un tiers ferait redémarrer en
+boucle des instances parfaitement saines.
+
+### Ce que `/ready` vérifie, et pourquoi si peu
+
+La règle appliquée : **ne sortir une instance du trafic que si la panne lui est
+locale et qu'une autre instance ferait mieux.** Une panne partagée ne se répare
+pas en retirant du trafic — elle se gère par retries et par un échec propre.
+
+Une seule dépendance satisfait ce critère : les **poids EasyOCR**. Sans eux, le
+premier document scanné déclencherait leur téléchargement (~98 Mo) *au milieu*
+du pipeline ; sur un système de fichiers éphémère, cette attente non bornée se
+rejoue à chaque instance froide, et une indisponibilité du CDN se traduirait en
+extraction ratée (`score_confiance = 0`) pour un document pourtant lisible. Le
+contrôle est une simple présence de fichier : pas de réseau, pas de chargement
+de torch, ~1 ms.
+
+Ne sont volontairement **pas** vérifiés :
+
+- **Groq** — jamais d'appel à un service payant depuis une sonde interrogée en
+  continu. Surtout, se retirer du trafic parce que Groq est tombé nous priverait
+  d'émettre les payloads d'échec : les documents resteraient bloqués « en
+  attente » côté API data au lieu de passer proprement en « erreur ». La
+  présence de la clé n'est pas testée non plus — `GROQ_API_KEY` est requise par
+  la configuration, donc l'application ne démarre pas sans elle.
+- **l'API data** (destination du callback) — panne partagée, non locale. Le
+  callback a ses propres retries, il intervient en fin de pipeline et non à
+  l'entrée, et si l'API data est indisponible elle ne nous envoie plus rien : il
+  n'y a aucun trafic à retirer.
+
+Limite assumée : une instance sans poids est retirée du trafic alors qu'elle
+traiterait encore les PDF natifs (le cas majoritaire). En production, les poids
+seront cuits dans l'image — le contrôle devient alors un contrôle d'intégrité
+d'image, toujours vert, rouge immédiatement si l'image est cassée.
+
+### Configuration Cloud Run
+
+- **Startup probe** sur `/health` : `periodSeconds: 10`, `failureThreshold: 6`,
+  `timeoutSeconds: 4` — laisse ~60 s de démarrage à froid.
+- **Liveness probe** sur `/health` : `periodSeconds: 30`, `timeoutSeconds: 4`,
+  `failureThreshold: 3`.
+- Cloud Run ne propose pas de readiness probe continue au sens Kubernetes :
+  `/ready` sert d'*uptime check* (une alerte « instance hors trafic ») et de
+  readiness le jour où le service tournerait sur GKE.
+- Le répertoire des poids EasyOCR se pilote par `EASYOCR_MODULE_PATH` (défaut
+  `~/.EasyOCR/`), utile pour pointer un volume ou l'emplacement choisi dans
+  l'image.
+
+> Si une instrumentation HTTP (OpenTelemetry, Prometheus) est ajoutée plus tard,
+> **exclure ces deux routes** : sondées en continu, elles écraseraient les
+> statistiques de latence et de taux d'erreur du trafic réel.
 
 ## Monitoring de la qualité d'extraction
 
