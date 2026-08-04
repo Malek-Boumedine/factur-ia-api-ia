@@ -22,6 +22,39 @@ uv run mypy src/                              # typage strict
 uv run pre-commit run --all-files             # lint + format
 ```
 
+### Avec Docker (local)
+
+```bash
+docker compose up --build                     # API sur http://localhost:8001
+```
+
+Le code est monté depuis l'hôte : uvicorn recharge à chaud. Le `.env` est lu tel
+quel, à une exception près — le compose force `DATA_API_BASE_URL` sur
+`http://host.docker.internal:8080`, puisque l'API data tourne sur l'hôte et non
+dans ce compose. **Elle doit écouter sur `0.0.0.0`** : sur `127.0.0.1`, elle
+reste injoignable depuis le conteneur.
+
+Les **poids EasyOCR** (~98 Mo) ne sont pas cuits dans l'image : ils sont
+téléchargés au premier document scanné dans le volume `ocr_models`, qui survit
+aux redémarrages comme aux reconstructions. Le premier scan est donc lent, et
+`GET /ready` répond 503 tant que le volume est vide — c'est exactement ce que la
+sonde est censée signaler. Pour l'amorcer et passer au vert tout de suite :
+
+```bash
+docker compose run --rm api uv run --no-sync \
+  python -c "import easyocr; easyocr.Reader(['fr','en'], gpu=False)"
+```
+
+Rien d'autre dans ce compose : pas de base de données (le service n'en a pas),
+pas de broker ni de worker (l'asynchrone tient dans le processus), pas de reverse
+proxy. Le monitoring MLflow écrit son `mlflow.db` dans le projet monté, sans
+volume dédié.
+
+> **Image ~1,5 Go.** `torch` est résolu depuis l'index CPU de PyTorch
+> (`tool.uv.sources` dans `pyproject.toml`) : les roues PyPI embarquent CUDA sur
+> Linux, soit ~4 Go de paquets `nvidia-*` pour un GPU que l'OCR n'utilise jamais
+> (`EASYOCR_GPU=False`). Cette redirection profite aussi au venv local et à la CI.
+
 ## Tests
 
 216 tests, 100 % de couverture de `src/`. La suite tourne en une dizaine de

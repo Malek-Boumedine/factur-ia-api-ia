@@ -1,0 +1,34 @@
+# ==============================================================================
+# Environnement LOCAL de l'API IA Factur-IA.
+# Un seul service : ce microservice n'a pas de base de données, et son
+# asynchrone tient dans le processus (BackgroundTasks) — donc ni broker, ni
+# worker. L'API data, destination du callback, tourne sur l'hôte.
+# ==============================================================================
+
+services:
+  api:
+    build: .
+    container_name: facturia-api-ia
+    ports:
+      - "8001:8001"
+    volumes:
+      # Code monté depuis l'hôte : uvicorn --reload recharge à chaud.
+      - .:/app
+      # Poids EasyOCR : téléchargés au premier document scanné, conservés
+      # ensuite d'un `docker compose up` — et d'une reconstruction — à l'autre.
+      - ocr_models:/models
+    # Variables locales (SECRET_OCR_TOKEN, GROQ_API_KEY, etc.).
+    env_file: .env
+    # Surcharges propres au contexte conteneur — elles priment sur le .env, qui
+    # garde ses valeurs « hôte » pour l'usage hors Docker.
+    environment:
+      # L'API data tourne sur l'hôte : host.docker.internal pointe vers lui.
+      # Elle doit écouter sur 0.0.0.0, sinon elle reste injoignable d'ici.
+      DATA_API_BASE_URL: http://host.docker.internal:8080
+    # Sous Linux, host.docker.internal n'existe pas par défaut : cette ligne
+    # le fait pointer vers la passerelle de l'hôte.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  ocr_models:

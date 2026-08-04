@@ -14,6 +14,11 @@ dependencies = [
     "loguru>=0.7",
     "pdfplumber>=0.11",
     "easyocr>=1.7",
+    # torch et torchvision arrivent par easyocr : on les déclare quand même ici,
+    # sinon la redirection vers l'index CPU (`tool.uv.sources`, plus bas) ne
+    # s'applique pas — elle ne vaut que pour les dépendances directes.
+    "torch>=2.6",
+    "torchvision>=0.21",
     "groq>=0.15",
     "pymupdf>=1.28.0",
     # Client de tracking MLflow seul (monitoring de la qualité d'extraction) :
@@ -25,6 +30,19 @@ dependencies = [
     "sqlalchemy>=2.0",
     "alembic>=1.13",
 ]
+
+# EasyOCR tire torch, dont les roues PyPI embarquent CUDA sur Linux (37 paquets
+# nvidia-*, ~4 Go) alors que l'OCR tourne en CPU (EASYOCR_GPU=False). On les
+# résout donc depuis l'index CPU officiel de PyTorch : environnement local, CI
+# et image Docker divisés par ~4.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
+torchvision = [{ index = "pytorch-cpu" }]
 
 [dependency-groups]
 dev = [
