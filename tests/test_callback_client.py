@@ -284,3 +284,17 @@ def test_5xx_then_success(monkeypatch: pytest.MonkeyPatch) -> None:
     send_callback(_payload())
 
     assert len(fake.calls) == 2
+
+
+def test_build_client_applique_le_timeout_configure() -> None:
+    """Le client HTTP réel est construit avec le timeout de la configuration.
+
+    Seul test à instancier le vrai ``httpx.Client`` (sans jamais s'en servir) :
+    les autres le remplacent pour se concentrer sur la logique d'envoi. Il
+    couvre le câblage de la configuration vers le transport, qui n'apparaît
+    nulle part ailleurs — un timeout non appliqué laisserait la tâche de fond
+    pendre indéfiniment sur une API data muette.
+    """
+    with callback_client._build_client() as client:
+        assert client.timeout.connect == settings.HTTP_TIMEOUT_SECONDS
+        assert client.timeout.read == settings.HTTP_TIMEOUT_SECONDS

@@ -22,6 +22,20 @@ uv run mypy src/                              # typage strict
 uv run pre-commit run --all-files             # lint + format
 ```
 
+## Tests
+
+210 tests, 100 % de couverture de `src/`. La suite tourne en une dizaine de
+secondes, **sans réseau** : le LLM Groq, EasyOCR et le callback de l'API data
+sont toujours simulés, et une garde installée dans `tests/conftest.py` fait
+échouer tout test qui tenterait une connexion réelle. Les documents d'exemple
+sont générés en mémoire (aucun binaire versionné, aucune donnée réelle : les
+SIRET et IBAN sont inventés).
+
+La **[stratégie de test](docs/strategie-de-test.md)** détaille, pour chaque étape
+du pipeline, la partie visée, le périmètre, l'approche retenue et les limites
+connues — notamment l'absence de vérité terrain, qui interdit toute mesure du
+taux d'erreur d'extraction.
+
 ## Monitoring de la qualité d'extraction
 
 ### À quoi ça sert

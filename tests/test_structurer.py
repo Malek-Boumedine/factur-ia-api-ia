@@ -160,6 +160,63 @@ def test_structure_invoice_non_object_json_raises(
         structure_invoice("texte brut")
 
 
+def test_structure_invoice_keeps_unexpected_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Un champ inventé par le modèle traverse la structuration sans la casser.
+
+    Le schéma strict l'interdit, mais un modèle en dérive peut en produire. Le
+    tri revient à la validation contrat (``validation.py``), seule à connaître la
+    liste fermée des champs : ce module parse, il ne filtre pas. Le vérifier ici
+    documente ce partage des responsabilités — et garantit qu'un champ en trop
+    ne fait pas échouer une extraction par ailleurs correcte.
+    """
+    payload = _model_payload(mention_speciale="autoliquidation")
+    monkeypatch.setattr(structurer, "call_llm", _fake_call_llm(payload))
+
+    result = structure_invoice("texte brut")
+
+    facture = result["facture"]
+    assert facture["mention_speciale"] == "autoliquidation"
+    assert facture["numero_facture"] == "FA-2026-042"  # le reste est intact
+
+
+def test_structure_invoice_tolerates_missing_contract_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Un champ du contrat omis par le modèle est simplement absent du dict.
+
+    Différent d'un champ à ``null`` : ici la clé n'existe pas du tout. La
+    structuration ne doit ni la fabriquer ni lever — le scoring en aval traitera
+    l'absence comme un champ non extrait.
+    """
+    donnees = json.loads(_model_payload())
+    del donnees["numero_facture"]
+    monkeypatch.setattr(structurer, "call_llm", _fake_call_llm(json.dumps(donnees)))
+
+    result = structure_invoice("texte brut")
+
+    assert "numero_facture" not in result["facture"]
+    assert result["facture"]["total_ht"] == Decimal("1000.00")
+
+
+def test_structure_invoice_keeps_incoherent_value_for_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Une valeur de type incohérent n'est pas jugée ici, mais transmise telle quelle.
+
+    « Mille euros » au lieu d'un nombre : le JSON est valide, la structuration
+    n'a rien à redire. C'est la validation contrat qui refusera de construire le
+    payload. Chaque étape a une seule responsabilité.
+    """
+    payload = _model_payload(total_ht="mille euros")
+    monkeypatch.setattr(structurer, "call_llm", _fake_call_llm(payload))
+
+    result = structure_invoice("texte brut")
+
+    assert result["facture"]["total_ht"] == "mille euros"
+
+
 @pytest.mark.parametrize(
     ("raw_type", "expected"),
     [
