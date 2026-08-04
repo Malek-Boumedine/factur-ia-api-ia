@@ -59,7 +59,7 @@ async def _validate_upload(file: UploadFile) -> None:
         if total > max_bytes:
             await file.seek(0)
             raise HTTPException(
-                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
                 detail=(
                     "Fichier trop volumineux "
                     f"(maximum {settings.MAX_UPLOAD_SIZE_MB} Mo)."
