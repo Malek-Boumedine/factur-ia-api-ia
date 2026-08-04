@@ -1,13 +1,21 @@
 """Configuration de l'application via Pydantic Settings.
 
 Les variables sont lues depuis l'environnement (ou le fichier .env en local).
-`Settings()` est instancié à l'import : toute variable requise manquante fait
-échouer le démarrage — c'est voulu (fail-fast sur une config incomplète).
+`Settings()` est instancié à l'import : toute variable requise manquante *ou
+vide* fait échouer le démarrage — c'est voulu (fail-fast sur une config
+incomplète).
 """
 
 from decimal import Decimal
+from typing import Annotated
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Variable indispensable au fonctionnement : absente *ou vide*, le démarrage
+# échoue. Sans `min_length`, une variable définie à `""` passe la validation et
+# la panne n'apparaît qu'au premier appel réel (extraction, callback).
+Requis = Annotated[str, Field(min_length=1)]
 
 
 class Settings(BaseSettings):
@@ -27,15 +35,15 @@ class Settings(BaseSettings):
     API_PORT: int = 8090
 
     # --- Sécurité (token partagé avec l'API data pour le callback OCR) ---
-    SECRET_OCR_TOKEN: str
+    SECRET_OCR_TOKEN: Requis
 
     # --- API data (callback) ---
-    DATA_API_BASE_URL: str
+    DATA_API_BASE_URL: Requis
     HTTP_TIMEOUT_SECONDS: float = 30.0
     HTTP_MAX_RETRIES: int = 3
 
     # --- LLM Groq ---
-    GROQ_API_KEY: str
+    GROQ_API_KEY: Requis
     GROQ_MODEL: str = "openai/gpt-oss-120b"
     GROQ_TIMEOUT_SECONDS: float = 60.0
 
