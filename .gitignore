@@ -144,6 +144,9 @@ rabbitmq-data/
 # ActiveMQ
 activemq-data/
 
+# Jeu de données des FAQ scrapées (non versionné)
+data/
+
 # SageMath parsed files
 *.sage.py
 
