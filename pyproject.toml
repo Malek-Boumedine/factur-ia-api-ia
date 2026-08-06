@@ -29,6 +29,7 @@ dependencies = [
     # migrations mais ne déclare pas ces deux dépendances, à fournir nous-mêmes.
     "sqlalchemy>=2.0",
     "alembic>=1.13",
+    "beautifulsoup4>=4.15.0",
 ]
 
 # EasyOCR tire torch, dont les roues PyPI embarquent CUDA sur Linux (37 paquets
