@@ -19,13 +19,15 @@ from src.extractions.structurer import LlmStructurationError, structure_invoice
 def _model_payload(**overrides: Any) -> str:
     """Sérialise une réponse modèle type, surchargeable champ par champ.
 
-    Miroir du schéma LLM plat : champs contrat + ``type_document``.
+    Miroir du schéma LLM plat : champs contrat + les deux champs hors contrat
+    (``type_document``, ``delai_paiement_jours``).
     """
     payload: dict[str, Any] = {
         "siret_emetteur": "12345678900011",
         "siret_destinataire": "98765432100022",
         "numero_facture": "FA-2026-042",
         "date_emission": "2026-07-06",
+        "date_echeance": "2026-08-05",
         "total_ht": 1000.00,
         "total_tva": 200.00,
         "total_ttc": 1200.00,
@@ -39,6 +41,7 @@ def _model_payload(**overrides: Any) -> str:
             }
         ],
         "type_document": "facture",
+        "delai_paiement_jours": None,
     }
     payload.update(overrides)
     return json.dumps(payload)
@@ -157,6 +160,63 @@ def test_structure_invoice_non_object_json_raises(
         structure_invoice("texte brut")
 
 
+def test_structure_invoice_keeps_unexpected_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Un champ inventé par le modèle traverse la structuration sans la casser.
+
+    Le schéma strict l'interdit, mais un modèle en dérive peut en produire. Le
+    tri revient à la validation contrat (``validation.py``), seule à connaître la
+    liste fermée des champs : ce module parse, il ne filtre pas. Le vérifier ici
+    documente ce partage des responsabilités — et garantit qu'un champ en trop
+    ne fait pas échouer une extraction par ailleurs correcte.
+    """
+    payload = _model_payload(mention_speciale="autoliquidation")
+    monkeypatch.setattr(structurer, "call_llm", _fake_call_llm(payload))
+
+    result = structure_invoice("texte brut")
+
+    facture = result["facture"]
+    assert facture["mention_speciale"] == "autoliquidation"
+    assert facture["numero_facture"] == "FA-2026-042"  # le reste est intact
+
+
+def test_structure_invoice_tolerates_missing_contract_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Un champ du contrat omis par le modèle est simplement absent du dict.
+
+    Différent d'un champ à ``null`` : ici la clé n'existe pas du tout. La
+    structuration ne doit ni la fabriquer ni lever — le scoring en aval traitera
+    l'absence comme un champ non extrait.
+    """
+    donnees = json.loads(_model_payload())
+    del donnees["numero_facture"]
+    monkeypatch.setattr(structurer, "call_llm", _fake_call_llm(json.dumps(donnees)))
+
+    result = structure_invoice("texte brut")
+
+    assert "numero_facture" not in result["facture"]
+    assert result["facture"]["total_ht"] == Decimal("1000.00")
+
+
+def test_structure_invoice_keeps_incoherent_value_for_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Une valeur de type incohérent n'est pas jugée ici, mais transmise telle quelle.
+
+    « Mille euros » au lieu d'un nombre : le JSON est valide, la structuration
+    n'a rien à redire. C'est la validation contrat qui refusera de construire le
+    payload. Chaque étape a une seule responsabilité.
+    """
+    payload = _model_payload(total_ht="mille euros")
+    monkeypatch.setattr(structurer, "call_llm", _fake_call_llm(payload))
+
+    result = structure_invoice("texte brut")
+
+    assert result["facture"]["total_ht"] == "mille euros"
+
+
 @pytest.mark.parametrize(
     ("raw_type", "expected"),
     [
@@ -217,13 +277,135 @@ def test_structure_invoice_missing_type_defaults_to_inconnu(
 def test_structure_invoice_separates_type_from_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # type_document ne doit PAS polluer le sous-ensemble contrat (facture).
+    # Les champs hors contrat ne doivent PAS polluer le sous-ensemble contrat.
     monkeypatch.setattr(structurer, "call_llm", _fake_call_llm(_VALID_JSON))
 
     result = structure_invoice("texte brut")
 
     assert "type_document" not in result["facture"]
+    assert "delai_paiement_jours" not in result["facture"]
     assert set(result) == {"type_document", "facture"}
+
+
+# --- Date d'échéance -------------------------------------------------------
+
+
+def test_date_echeance_absolue_extraite(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Cas nominal : l'échéance écrite sur le document remonte telle quelle.
+    monkeypatch.setattr(structurer, "call_llm", _fake_call_llm(_VALID_JSON))
+
+    result = structure_invoice("texte brut")
+
+    assert result["facture"]["date_echeance"] == "2026-08-05"
+
+
+def test_date_echeance_distincte_de_l_emission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Anti-régression du bug d'origine : les deux dates sont deux champs distincts,
+    # l'échéance n'écrase pas l'émission et n'en est pas une recopie.
+    monkeypatch.setattr(structurer, "call_llm", _fake_call_llm(_VALID_JSON))
+
+    facture = structure_invoice("texte brut")["facture"]
+
+    assert facture["date_emission"] == "2026-07-06"
+    assert facture["date_echeance"] != facture["date_emission"]
+
+
+def test_date_echeance_derivee_du_delai(monkeypatch: pytest.MonkeyPatch) -> None:
+    # « Paiement à 30 jours » sans date absolue : Python calcule émission + délai.
+    payload = _model_payload(date_echeance=None, delai_paiement_jours=30)
+    monkeypatch.setattr(structurer, "call_llm", _fake_call_llm(payload))
+
+    result = structure_invoice("facture payable à 30 jours")
+
+    assert result["facture"]["date_echeance"] == "2026-08-05"  # 2026-07-06 + 30 j
+
+
+def test_date_echeance_absolue_prioritaire_sur_le_delai(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Les deux présents : la date lue sur le document fait autorité, pas le calcul.
+    payload = _model_payload(date_echeance="2026-09-30", delai_paiement_jours=30)
+    monkeypatch.setattr(structurer, "call_llm", _fake_call_llm(payload))
+
+    result = structure_invoice("texte brut")
+
+    assert result["facture"]["date_echeance"] == "2026-09-30"
+
+
+def test_delai_sans_date_emission_ne_derive_rien(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Sans date d'émission lisible, il n'y a rien à quoi ajouter le délai : on ne
+    # devine pas d'échéance.
+    payload = _model_payload(
+        date_emission=None, date_echeance=None, delai_paiement_jours=30
+    )
+    monkeypatch.setattr(structurer, "call_llm", _fake_call_llm(payload))
+
+    result = structure_invoice("texte brut")
+
+    assert result["facture"]["date_echeance"] is None
+
+
+def test_date_emission_illisible_ne_derive_rien(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Date d'émission non ISO (modèle qui n'a pas suivi la consigne) : pas de calcul
+    # hasardeux sur une date qu'on ne sait pas parser.
+    payload = _model_payload(
+        date_emission="06/07/2026", date_echeance=None, delai_paiement_jours=30
+    )
+    monkeypatch.setattr(structurer, "call_llm", _fake_call_llm(payload))
+
+    result = structure_invoice("texte brut")
+
+    assert result["facture"]["date_echeance"] is None
+
+
+@pytest.mark.parametrize("delai", [-10, 400, "trente", True, None])
+def test_delai_implausible_ignore(monkeypatch: pytest.MonkeyPatch, delai: Any) -> None:
+    # Délai négatif, hors plage (> 1 an), non numérique ou booléen : mieux vaut une
+    # échéance nulle qu'une date fabriquée.
+    payload = _model_payload(date_echeance=None, delai_paiement_jours=delai)
+    monkeypatch.setattr(structurer, "call_llm", _fake_call_llm(payload))
+
+    result = structure_invoice("texte brut")
+
+    assert result["facture"]["date_echeance"] is None
+
+
+def test_delai_decimal_fractionnaire_ignore(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Un délai à virgule n'est pas un nombre de jours : on n'en dérive rien.
+    payload = _model_payload(date_echeance=None, delai_paiement_jours=30.5)
+    monkeypatch.setattr(structurer, "call_llm", _fake_call_llm(payload))
+
+    result = structure_invoice("texte brut")
+
+    assert result["facture"]["date_echeance"] is None
+
+
+def test_delai_decimal_entier_accepte(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Le schéma impose un entier, mais un modèle peut renvoyer 30.0 (parsé Decimal).
+    payload = _model_payload(date_echeance=None, delai_paiement_jours=30.0)
+    monkeypatch.setattr(structurer, "call_llm", _fake_call_llm(payload))
+
+    result = structure_invoice("texte brut")
+
+    assert result["facture"]["date_echeance"] == "2026-08-05"
+
+
+def test_absence_totale_d_echeance_reste_null(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Facture payable comptant : ni date ni délai → null, sans rien inventer.
+    payload = _model_payload(date_echeance=None, delai_paiement_jours=None)
+    monkeypatch.setattr(structurer, "call_llm", _fake_call_llm(payload))
+
+    result = structure_invoice("texte brut")
+
+    assert result["facture"]["date_echeance"] is None
 
 
 def test_system_prompt_teaches_french_amount_reading() -> None:
@@ -240,6 +422,40 @@ def test_system_prompt_teaches_french_amount_reading() -> None:
     assert "« 12 345,67 » vaut `12345.67`" in prompt
     assert "« 850,00 » vaut `850.00`" in prompt
     assert "Ne tronque JAMAIS" in prompt
+
+
+def test_system_prompt_asks_for_date_echeance() -> None:
+    # Anti-régression (bug constaté : échéance jamais extraite car jamais demandée).
+    # Le prompt doit réclamer la date d'échéance ET la distinguer explicitement de la
+    # date d'émission — la confusion des deux est le mode d'échec principal.
+    # Espaces normalisés : le prompt est replié à 88 colonnes.
+    prompt = " ".join(SYSTEM_PROMPT.split())
+    assert "`date_echeance`" in prompt
+    assert "DATE LIMITE DE PAIEMENT" in prompt
+    assert "NE CONFONDS PAS les deux dates" in prompt
+    assert "à régler avant le" in prompt
+    # Formats français en entrée et cas du délai.
+    assert "« 15 mars 2026 » vaut `2026-03-15`" in prompt
+    assert "le JOUR précède le MOIS" in prompt
+    assert "`delai_paiement_jours`" in prompt
+    assert "net 30" in prompt
+
+
+def test_schema_includes_date_echeance_in_contract_subset() -> None:
+    # ``date_echeance`` appartient au miroir du contrat (elle part au callback),
+    # contrairement au délai qui reste hors contrat.
+    schema = INVOICE_JSON_SCHEMA["json_schema"]["schema"]
+
+    assert schema["properties"]["date_echeance"] == {"type": ["string", "null"]}
+    assert "date_echeance" in schema["required"]
+
+
+def test_structuration_schema_constrains_delai_paiement() -> None:
+    # Le délai est ajouté à plat, entier nullable, et requis (contrainte strict mode).
+    schema = INVOICE_JSON_SCHEMA["json_schema"]["schema"]
+
+    assert schema["properties"]["delai_paiement_jours"] == {"type": ["integer", "null"]}
+    assert "delai_paiement_jours" in schema["required"]
 
 
 def test_structuration_schema_constrains_type_document() -> None:

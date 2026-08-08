@@ -40,9 +40,14 @@ from typing import Any
 from pydantic import ValidationError
 
 from src.callback.schemas import OcrWebhookPayload
+from src.extractions.prompts import TypeDocument
 
 # Totaux non-nullables au contrat mais nullables côté LLM : la divergence à résoudre.
 _TOTAL_FIELDS = ("total_ht", "total_tva", "total_ttc")
+
+# Champs date du contrat : nullables, ramenés à ``None`` si le modèle a renvoyé une
+# chaîne non ISO (on ne fait pas échouer tout le payload pour une date illisible).
+_DATE_FIELDS = ("date_emission", "date_echeance")
 
 
 class PayloadValidationError(Exception):
@@ -105,8 +110,9 @@ def _prepare(facture: dict[str, Any]) -> dict[str, Any]:
     """Coerce le ``dict`` LLM vers le contrat, sans jeter l'extraction.
 
     - totaux ``null`` (ou absents) → ``Decimal("0")`` (divergence LLM/contrat) ;
-    - ``date_emission`` présente mais non parsable → ``None`` (champ nullable au
-      contrat : on ne fait pas échouer tout le payload pour une date illisible).
+    - date (``date_emission``, ``date_echeance``) présente mais non parsable →
+      ``None`` (champs nullables au contrat : on ne fait pas échouer tout le payload
+      pour une date illisible).
 
     Les autres champs (SIRET, numéro, IBAN, lignes) sont laissés tels quels : Pydantic
     les valide et coerce en aval.
@@ -117,9 +123,10 @@ def _prepare(facture: dict[str, Any]) -> dict[str, Any]:
         if prepared.get(field) is None:
             prepared[field] = Decimal("0")
 
-    date_value = prepared.get("date_emission")
-    if isinstance(date_value, str) and not _is_iso_date(date_value):
-        prepared["date_emission"] = None
+    for field in _DATE_FIELDS:
+        date_value = prepared.get(field)
+        if isinstance(date_value, str) and not _is_iso_date(date_value):
+            prepared[field] = None
 
     return prepared
 
@@ -128,13 +135,16 @@ def validate_extraction(
     id_document: int,
     facture: dict[str, Any],
     score_confiance: Decimal,
+    par_champ: dict[str, Decimal] | None = None,
+    type_document: TypeDocument | None = None,
 ) -> OcrWebhookPayload:
     """Valide l'extraction structurée et construit le payload contrat à transmettre.
 
     Si l'extraction est inexploitable (aucun total lisible **et** aucune ligne),
     renvoie le payload d'échec (``score_confiance = 0``) — cas normal, sans exception.
     Sinon, coerce la donnée (totaux ``null`` → 0, date illisible → ``None``) puis
-    construit et valide un ``OcrWebhookPayload`` avec le ``score_confiance`` fourni.
+    construit et valide un ``OcrWebhookPayload`` avec le ``score_confiance`` fourni,
+    enrichi des champs optionnels du contrat (``par_champ``, ``type_document``).
 
     Args:
         id_document: identifiant du document (vient de la requête).
@@ -142,10 +152,15 @@ def validate_extraction(
             (montants en ``Decimal``, totaux éventuellement ``null``).
         score_confiance: confiance calculée par ``compute_confidence`` (toujours > 0).
             Ignoré et forcé à ``0`` sur le chemin inexploitable.
+        par_champ: confiances par champ de ``compute_confidence``, transmises telles
+            quelles dans le champ optionnel ``par_champ`` du contrat.
+        type_document: suggestion de type issue de ``structure_invoice``, transmise
+            dans le champ optionnel ``type_document`` du contrat.
 
     Returns:
         Un ``OcrWebhookPayload`` valide (extraction exploitable) ou le payload d'échec
-        (``score_confiance = 0``) si l'extraction est vide de sens.
+        (``score_confiance = 0``, sans ``par_champ`` ni ``type_document``) si
+        l'extraction est vide de sens.
 
     Raises:
         PayloadValidationError: la donnée ne construit pas un ``OcrWebhookPayload``
@@ -159,6 +174,8 @@ def validate_extraction(
         **prepared,
         "id_document": id_document,
         "score_confiance": score_confiance,
+        "par_champ": par_champ,
+        "type_document": type_document,
     }
     try:
         return OcrWebhookPayload.model_validate(data)

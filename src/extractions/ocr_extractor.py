@@ -18,8 +18,15 @@ Deux optimisations volontaires :
   module ne charge donc pas torch.
 - le ``Reader`` EasyOCR (chargement des modèles, coûteux) est construit une seule
   fois et mis en cache au niveau module, puis réutilisé à chaque appel.
+
+Ce module expose aussi ``ocr_model_available()``, qui répond « les poids OCR
+sont-ils installés ? » sans rien charger : c'est le seul contrôle de la sonde de
+readiness (``GET /ready``). Il vit ici parce que c'est ce module qui connaît
+EasyOCR — ``main.py`` n'a pas à savoir où sont rangés les poids.
 """
 
+import os
+from pathlib import Path
 from typing import Any
 
 import fitz
@@ -70,6 +77,53 @@ def _get_reader() -> Any:
 
         _reader = easyocr.Reader(settings.ocr_languages_list, gpu=settings.EASYOCR_GPU)
     return _reader
+
+
+def _model_storage_directory() -> Path:
+    """Renvoie le répertoire où EasyOCR range ses poids, résolu comme elle le fait.
+
+    Reflet volontaire d'un détail interne d'``easyocr`` (``easyocr/config.py``) :
+    on ne peut pas le lire en important la bibliothèque, puisque cet import charge
+    torch — inacceptable depuis une sonde interrogée en continu. Les deux
+    variables d'environnement consultées, et leur ordre de priorité, sont ceux
+    d'``easyocr`` ; à resynchroniser si elle change sa résolution.
+    """
+    base = (
+        os.environ.get("EASYOCR_MODULE_PATH")
+        or os.environ.get("MODULE_PATH")
+        or os.path.expanduser("~/.EasyOCR/")
+    )
+    return Path(base) / "model"
+
+
+def ocr_model_available() -> bool:
+    """Indique si des poids OCR sont installés localement, sans rien charger.
+
+    Support de la sonde de readiness (``GET /ready``). Sans ces poids, le premier
+    document scanné déclencherait leur téléchargement (~98 Mo) *au milieu* du
+    pipeline : sur un système de fichiers éphémère, cette attente non bornée se
+    rejoue à chaque instance froide, et une indisponibilité du CDN se traduirait
+    en extraction ratée (``score_confiance = 0``) pour un document pourtant
+    lisible. C'est la seule dépendance du service qui soit locale à l'instance —
+    donc la seule dont la panne justifie de sortir du trafic.
+
+    On teste la **présence d'au moins un fichier de poids**, pas des noms
+    précis : le mode de panne réel est un répertoire vide (image construite sans
+    les poids, instance fraîche), et ce critère ne casse ni quand ``easyocr``
+    renomme ses fichiers, ni quand ``OCR_LANGUAGES`` change de réseau de
+    reconnaissance.
+
+    Une sonde ne doit jamais lever, et celle-ci ne le peut pas : ``Path.glob``
+    absorbe les erreurs du système de fichiers (répertoire absent, droits
+    refusés, parent qui n'est pas un répertoire) et renvoie simplement un
+    résultat vide — tous ces cas se traduisent donc en « indisponible », sans
+    garde explicite à écrire.
+
+    Returns:
+        ``True`` si au moins un fichier de poids est présent, ``False`` sinon
+        (répertoire vide, absent, ou illisible).
+    """
+    return any(_model_storage_directory().glob("*.pth"))
 
 
 def _ocr_image(image: bytes) -> str:

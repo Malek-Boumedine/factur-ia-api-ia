@@ -47,6 +47,11 @@ def _payload() -> OcrWebhookPayload:
                 taux_tva=Decimal("20"),
             )
         ],
+        type_document="facture",
+        par_champ={
+            "siret_emetteur": Decimal("1.0000"),
+            "lignes": Decimal("0.8333"),
+        },
     )
 
 
@@ -128,6 +133,42 @@ def test_serialization_preserves_amounts_and_date(
     assert body["id_document"] == 42
     assert body["lignes"][0]["prix_unitaire_ht"] == "500.00"
     assert body["lignes"][0]["taux_tva"] == "20"
+
+
+def test_serialization_of_optional_contract_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Les champs optionnels du contrat partent en JSON : ``type_document`` en
+    chaîne simple, les scores de ``par_champ`` en chaînes (comme les Decimal)."""
+    fake = _install(monkeypatch, [_FakeResponse(200, _OK_BODY)])
+
+    send_callback(_payload())
+
+    body = json.loads(fake.calls[0]["content"])
+    assert body["type_document"] == "facture"
+    assert body["par_champ"] == {"siret_emetteur": "1.0000", "lignes": "0.8333"}
+
+
+def test_serialization_without_optional_fields_is_backward_compatible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Un payload sans les champs optionnels (ex. payload d'échec) reste valide et
+    les sérialise à ``null`` : l'ajout au contrat est purement additif."""
+    fake = _install(monkeypatch, [_FakeResponse(200, _OK_BODY)])
+    minimal = OcrWebhookPayload(
+        id_document=42,
+        score_confiance=Decimal("0"),
+        total_ht=Decimal("0"),
+        total_tva=Decimal("0"),
+        total_ttc=Decimal("0"),
+    )
+
+    send_callback(minimal)
+
+    body = json.loads(fake.calls[0]["content"])
+    assert body["type_document"] is None
+    assert body["par_champ"] is None
+    assert body["score_confiance"] == "0"
 
 
 def test_success_logs_returned_ids(
@@ -243,3 +284,17 @@ def test_5xx_then_success(monkeypatch: pytest.MonkeyPatch) -> None:
     send_callback(_payload())
 
     assert len(fake.calls) == 2
+
+
+def test_build_client_applique_le_timeout_configure() -> None:
+    """Le client HTTP réel est construit avec le timeout de la configuration.
+
+    Seul test à instancier le vrai ``httpx.Client`` (sans jamais s'en servir) :
+    les autres le remplacent pour se concentrer sur la logique d'envoi. Il
+    couvre le câblage de la configuration vers le transport, qui n'apparaît
+    nulle part ailleurs — un timeout non appliqué laisserait la tâche de fond
+    pendre indéfiniment sur une API data muette.
+    """
+    with callback_client._build_client() as client:
+        assert client.timeout.connect == settings.HTTP_TIMEOUT_SECONDS
+        assert client.timeout.read == settings.HTTP_TIMEOUT_SECONDS

@@ -1,29 +1,15 @@
 """Tests de l'extraction du texte des PDF natifs.
 
-Fixtures générées en mémoire avec reportlab : PDF natifs avec texte connu,
-mono et multi-pages, plus un cas de page vide au milieu et un PDF corrompu.
+Documents issus de la fabrique partagée (``tests/fixtures/documents.py``),
+générés en mémoire : PDF natifs avec texte connu, mono et multi-pages, plus un
+cas de page vide au milieu et un PDF corrompu.
 """
 
-import io
-
 import pytest
-from reportlab.pdfgen import canvas
 from src.extractions.pdf_extractor import PdfExtractionError, extract_native_pdf_text
 
-
-def _pdf_with_pages(*pages: str | None) -> bytes:
-    """PDF natif dont chaque argument est le texte d'une page.
-
-    ``None`` produit une page sans texte (comme une page image au milieu).
-    """
-    buffer = io.BytesIO()
-    pdf = canvas.Canvas(buffer)
-    for text in pages:
-        if text is not None:
-            pdf.drawString(100, 750, text)
-        pdf.showPage()
-    pdf.save()
-    return buffer.getvalue()
+from tests.fixtures import documents
+from tests.fixtures.documents import pdf_with_pages as _pdf_with_pages
 
 
 def test_extract_single_page_text() -> None:
@@ -50,7 +36,7 @@ def test_extract_skips_empty_middle_page() -> None:
 
 def test_extract_corrupted_pdf_raises() -> None:
     with pytest.raises(PdfExtractionError):
-        extract_native_pdf_text(b"%PDF-1.4 ceci n'est pas un vrai PDF")
+        extract_native_pdf_text(documents.PDF_CORROMPU)
 
 
 def test_extract_pdf_without_text_raises() -> None:

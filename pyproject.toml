@@ -1,6 +1,6 @@
 [project]
 name = "factur-ia-api-ia"
-version = "1.3.0"
+version = "1.4.0"
 description = "Microservice IA d'extraction de factures (OCR + LLM) pour le système Factur-IA"
 readme = "README.md"
 requires-python = ">=3.13"
@@ -14,9 +14,36 @@ dependencies = [
     "loguru>=0.7",
     "pdfplumber>=0.11",
     "easyocr>=1.7",
+    # torch et torchvision arrivent par easyocr : on les déclare quand même ici,
+    # sinon la redirection vers l'index CPU (`tool.uv.sources`, plus bas) ne
+    # s'applique pas — elle ne vaut que pour les dépendances directes.
+    "torch>=2.6",
+    "torchvision>=0.21",
     "groq>=0.15",
     "pymupdf>=1.28.0",
+    # Client de tracking MLflow seul (monitoring de la qualité d'extraction) :
+    # le paquet `mlflow` complet embarque le serveur et tire pandas, numpy,
+    # scikit-learn et Flask — inutiles pour écrire des métriques.
+    "mlflow-skinny>=3.0",
+    # Backend de tracking local SQLite : `mlflow-skinny` embarque le store et ses
+    # migrations mais ne déclare pas ces deux dépendances, à fournir nous-mêmes.
+    "sqlalchemy>=2.0",
+    "alembic>=1.13",
+    "beautifulsoup4>=4.15.0",
 ]
+
+# EasyOCR tire torch, dont les roues PyPI embarquent CUDA sur Linux (37 paquets
+# nvidia-*, ~4 Go) alors que l'OCR tourne en CPU (EASYOCR_GPU=False). On les
+# résout donc depuis l'index CPU officiel de PyTorch : environnement local, CI
+# et image Docker divisés par ~4.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
+torchvision = [{ index = "pytorch-cpu" }]
 
 [dependency-groups]
 dev = [
@@ -26,6 +53,9 @@ dev = [
     "detect-secrets>=1.5",
     "pre-commit>=4.0",
     "python-semantic-release>=9.15",
+    # MLflow complet : uniquement pour l'interface de restitution locale
+    # (`uv run mlflow ui`). Le service, lui, n'a besoin que de `mlflow-skinny`.
+    "mlflow>=3.0",
 ]
 test = [
     "pytest>=8.3",
