@@ -30,6 +30,14 @@ dependencies = [
     "sqlalchemy>=2.0",
     "alembic>=1.13",
     "beautifulsoup4>=4.15.0",
+    # Observabilité OpenTelemetry (mêmes bornes que l'API data) : traces OTLP et
+    # métriques Prometheus, désactivées par défaut. Tout est pur Python, quelques
+    # Mo au total — sans effet notable sur le poids de l'image.
+    "opentelemetry-exporter-otlp-proto-http>=1.44.0",
+    "opentelemetry-exporter-prometheus>=0.65b0",
+    "opentelemetry-instrumentation-fastapi>=0.65b0",
+    "opentelemetry-instrumentation-httpx>=0.65b0",
+    "opentelemetry-sdk>=1.44.0",
 ]
 
 # EasyOCR tire torch, dont les roues PyPI embarquent CUDA sur Linux (37 paquets

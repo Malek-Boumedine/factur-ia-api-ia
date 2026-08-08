@@ -6,6 +6,7 @@ from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 
 from src.core.config import settings
+from src.core.telemetry import setup_telemetry
 from src.extractions.ocr_extractor import ocr_model_available
 from src.extractions.router import router as extractions_router
 
@@ -50,6 +51,10 @@ app.add_middleware(
 
 app.include_router(extractions_router)
 
+# Instrumentation OpenTelemetry (traces + métriques Prometheus sur /metrics) —
+# no-op si OTEL_ENABLED et OTEL_METRICS_ENABLED sont faux, le défaut.
+setup_telemetry(app)
+
 
 # --- Sondes de disponibilité ------------------------------------------------
 #
@@ -59,12 +64,11 @@ app.include_router(extractions_router)
 # métier — et sans aucune information exploitable dans les réponses (ni version,
 # ni configuration, ni détail d'erreur).
 #
-# ATTENTION si une instrumentation HTTP (OpenTelemetry, Prometheus) est ajoutée
-# ici plus tard : ces deux routes doivent en être EXCLUES. Sondées en continu,
-# elles représenteraient l'essentiel du volume de requêtes et écraseraient les
-# statistiques de latence et de taux d'erreur du trafic réel. Le monitoring
-# actuel (MLflow) ne trace que la qualité d'extraction, document par document :
-# les sondes ne le touchent jamais, il n'y a rien à exclure aujourd'hui.
+# Ces deux routes sont EXCLUES de l'instrumentation OpenTelemetry (traces et
+# métriques, cf. EXCLUDED_URLS dans core/telemetry.py), comme /metrics :
+# sondées et scrapées en continu, elles représenteraient l'essentiel du volume
+# de requêtes et écraseraient les statistiques de latence et de taux d'erreur
+# du trafic réel.
 
 
 @app.get("/health", include_in_schema=False)
