@@ -1,5 +1,6 @@
 from datetime import date
 from decimal import Decimal
+from typing import Literal
 
 from pydantic import BaseModel
 
@@ -18,8 +19,19 @@ class OcrWebhookPayload(BaseModel):
     siret_destinataire: str | None = None
     numero_facture: str | None = None
     date_emission: date | None = None
+    # Extension additive du contrat : date limite de paiement, lue sur le document
+    # ou dérivée d'un délai (« net 30 ») côté structuration. ``None`` si absente ou
+    # illisible — une API data qui ne connaît pas encore ce champ l'ignore.
+    date_echeance: date | None = None
     total_ht: Decimal
     total_tva: Decimal
     total_ttc: Decimal
     iban: str | None = None
     lignes: list[LigneOcr] = []
+    # Extension additive du contrat (optionnels, ``None`` = non calculé — payload
+    # d'échec ou version antérieure du service) : le type de document suggéré par
+    # l'IA (décision finale à l'humain) et la confiance par champ (clés = noms des
+    # champs ci-dessus, scores 0-1 quantifiés à 4 décimales) pour le surlignage
+    # des champs douteux côté front.
+    type_document: Literal["devis", "facture", "avoir", "inconnu"] | None = None
+    par_champ: dict[str, Decimal] | None = None

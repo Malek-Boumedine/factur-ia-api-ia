@@ -85,8 +85,6 @@ def detect_pdf_type(content: bytes) -> PdfType:
     try:
         with pdfplumber.open(io.BytesIO(content)) as pdf:
             real_chars = _count_real_text_chars(pdf)
-    except PdfDetectionError:
-        raise
     except Exception as exc:  # pdfminer lève des exceptions variées et peu typées
         raise PdfDetectionError(
             "PDF illisible ou corrompu : détection de la nature impossible."

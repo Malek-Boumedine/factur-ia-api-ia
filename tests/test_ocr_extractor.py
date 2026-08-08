@@ -5,16 +5,16 @@ en CI. On teste la *logique* (conversion PDF→image via PyMuPDF, appel de l'OCR
 page par page, concaténation, gestion d'erreur, cache du Reader), pas la qualité
 de reconnaissance d'EasyOCR lui-même.
 
-La conversion PyMuPDF est exercée pour de vrai : les fixtures PDF sont générées
-avec reportlab, seul l'OCR est remplacé par un faux Reader.
+La conversion PyMuPDF est exercée pour de vrai : les documents viennent de la
+fabrique partagée (``tests/fixtures/documents.py``), seul l'OCR est remplacé par
+un faux Reader.
 """
 
-import io
-
 import pytest
-from reportlab.pdfgen import canvas
 from src.extractions import ocr_extractor
 from src.extractions.ocr_extractor import OcrExtractionError, extract_ocr_text
+
+from tests.fixtures import documents
 
 
 class _FakeReader:
@@ -36,13 +36,7 @@ class _FakeReader:
 
 def _pdf_with_pages(n: int) -> bytes:
     """PDF de ``n`` pages (contenu quelconque : l'OCR est mocké)."""
-    buffer = io.BytesIO()
-    pdf = canvas.Canvas(buffer)
-    for i in range(n):
-        pdf.drawString(100, 750, f"page {i}")
-        pdf.showPage()
-    pdf.save()
-    return buffer.getvalue()
+    return documents.pdf_with_pages(*(f"page {i}" for i in range(n)))
 
 
 @pytest.fixture(autouse=True)
@@ -81,7 +75,7 @@ def test_ocr_corrupted_pdf_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(ocr_extractor, "_get_reader", lambda: reader)
 
     with pytest.raises(OcrExtractionError):
-        extract_ocr_text(b"%PDF-1.4 ceci n'est pas un vrai PDF", is_pdf=True)
+        extract_ocr_text(documents.PDF_CORROMPU, is_pdf=True)
 
 
 def test_ocr_reader_error_raises(monkeypatch: pytest.MonkeyPatch) -> None:

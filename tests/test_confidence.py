@@ -8,6 +8,7 @@ réservée à l'orchestrateur).
 Fixtures : SIRET et IBAN réellement valides (clé de Luhn / mod-97 vérifiées).
 """
 
+from datetime import date, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -52,6 +53,32 @@ def _facture(**overrides: Any) -> dict[str, Any]:
     return facture
 
 
+# --- Quantification (par_champ part au callback) ----------------------------
+
+
+def test_par_champ_quantifie_a_quatre_decimales() -> None:
+    """Les scores par champ sont quantifiés à 4 décimales avant restitution :
+    une moyenne périodique (2.5/3) ressort 0.8333, pas un Decimal à 28 décimales."""
+    ligne_valide = {
+        "designation": "Prestation de conseil",
+        "quantite": 2,
+        "prix_unitaire_ht": Decimal("500.00"),
+        "taux_tva": Decimal("20.00"),
+    }
+    # 2 contrôles sur 4 valides (prix absent, taux illégal) → score de ligne 0.5.
+    ligne_douteuse = {
+        "designation": "Fourniture",
+        "quantite": 1,
+        "prix_unitaire_ht": None,
+        "taux_tva": Decimal("19"),
+    }
+    result = compute_confidence(
+        _facture(lignes=[ligne_valide, ligne_valide, ligne_douteuse])
+    )
+
+    assert result.par_champ["lignes"] == Decimal("0.8333")
+
+
 # --- Cas nominal -----------------------------------------------------------
 
 
@@ -73,7 +100,7 @@ def test_cas_nominal_score_eleve() -> None:
 
 
 def test_par_champ_contient_tous_les_champs() -> None:
-    """``par_champ`` expose toujours les neuf champs (prêt pour le surlignage front)."""
+    """``par_champ`` expose toujours les dix champs (prêt pour le surlignage front)."""
     result = compute_confidence(_facture())
 
     assert set(result.par_champ) == {
@@ -81,6 +108,7 @@ def test_par_champ_contient_tous_les_champs() -> None:
         "siret_destinataire",
         "numero_facture",
         "date_emission",
+        "date_echeance",
         "total_ht",
         "total_tva",
         "total_ttc",
@@ -140,6 +168,76 @@ def test_date_non_parsable_penalise() -> None:
     """Date présente mais non parsable → confiance dégradée (mal formée)."""
     result = compute_confidence(_facture(date_emission="15/01/2026"))
     assert result.par_champ["date_emission"] == _MALFORMED
+
+
+# --- Date d'échéance -------------------------------------------------------
+
+
+def test_echeance_future_pleinement_confiante() -> None:
+    """Une échéance À VENIR est le cas normal, pas une anomalie.
+
+    Différence clé avec la date d'émission (jamais future) : la borner à aujourd'hui
+    dégraderait toute facture non encore échue.
+    """
+    future = (date.today() + timedelta(days=30)).isoformat()
+    result = compute_confidence(_facture(date_echeance=future))
+    assert result.par_champ["date_echeance"] == Decimal("1")
+
+
+def test_echeance_passee_posterieure_a_l_emission_confiante() -> None:
+    """Facture ancienne déposée tardivement : échéance passée mais légitime."""
+    result = compute_confidence(_facture(date_echeance="2026-02-15"))
+    assert result.par_champ["date_echeance"] == Decimal("1")
+
+
+def test_echeance_anterieure_a_l_emission_signalee() -> None:
+    """Échéance avant émission → incohérence : dates probablement inversées.
+
+    C'est le contrôle croisé qui rend visible la confusion émission/échéance.
+    """
+    result = compute_confidence(
+        _facture(date_emission="2026-01-15", date_echeance="2026-01-01")
+    )
+    assert result.par_champ["date_echeance"] == _INTEGRITY_FAILED
+
+
+def test_echeance_sans_date_emission_reste_scorable() -> None:
+    """Émission absente : le contrôle croisé est impossible, l'échéance est jugée
+    sur sa seule plausibilité (même esprit que ``HT + TVA = TTC`` invérifiable)."""
+    result = compute_confidence(
+        _facture(date_emission=None, date_echeance="2026-02-15")
+    )
+    assert result.par_champ["date_echeance"] == Decimal("1")
+
+
+def test_echeance_non_parsable_penalisee() -> None:
+    """Échéance présente mais non ISO → mal formée (comme la date d'émission)."""
+    result = compute_confidence(_facture(date_echeance="15/02/2026"))
+    assert result.par_champ["date_echeance"] == _MALFORMED
+
+
+def test_echeance_trop_lointaine_degradee() -> None:
+    """Au-delà de l'horizon admis, une erreur de lecture est plus probable qu'un
+    vrai terme de paiement."""
+    lointaine = (date.today() + timedelta(days=1200)).isoformat()
+    result = compute_confidence(_facture(date_echeance=lointaine))
+    assert result.par_champ["date_echeance"] == Decimal("0.5")
+
+
+def test_echeance_absente_signalee_sans_penaliser_le_score() -> None:
+    """Champ non critique absent : signalé à 0 mais exclu de la moyenne.
+
+    Une facture payable comptant (sans échéance) doit garder EXACTEMENT le score
+    qu'elle avait avant l'ajout du champ — d'où la valeur nominale épinglée.
+    """
+    sans_cle = compute_confidence(_facture())
+    cle_nulle = compute_confidence(_facture(date_echeance=None))
+
+    assert sans_cle.par_champ["date_echeance"] == Decimal("0")
+    assert sans_cle.score_global == cle_nulle.score_global
+    # Score nominal historique (moyenne pondérée sur les 9 champs d'origine) :
+    # inchangé par l'ajout d'un 10e champ absent.
+    assert sans_cle.score_global == Decimal("0.9684")
 
 
 # --- Champs manquants ------------------------------------------------------

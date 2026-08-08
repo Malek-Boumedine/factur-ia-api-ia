@@ -144,6 +144,9 @@ rabbitmq-data/
 # ActiveMQ
 activemq-data/
 
+# Jeu de données des FAQ scrapées (non versionné)
+data/
+
 # SageMath parsed files
 *.sage.py
 
@@ -226,6 +229,12 @@ __marimo__/
 todo*
 local_ci.sh
 /uploads
+
+# monitoring MLflow : store local des métriques de qualité d'extraction
+mlflow.db
+mlflow.db-journal
+/mlruns/
+/mlartifacts/
 
 # Claude Code
 .claude/
