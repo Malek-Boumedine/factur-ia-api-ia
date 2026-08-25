@@ -29,6 +29,9 @@ dependencies = [
     # migrations mais ne déclare pas ces deux dépendances, à fournir nous-mêmes.
     "sqlalchemy>=2.0",
     "alembic>=1.13",
+    # Pilote MySQL du tracking MLflow en production (Cloud SQL, cf. README) :
+    # URI `mysql+pymysql://...`. Même pilote que le client Django.
+    "pymysql>=1.2.0",
     "beautifulsoup4>=4.15.0",
     # Observabilité OpenTelemetry (mêmes bornes que l'API data) : traces OTLP et
     # métriques Prometheus, désactivées par défaut. Tout est pur Python, quelques

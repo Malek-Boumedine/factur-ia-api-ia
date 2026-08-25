@@ -36,6 +36,15 @@ Rien d'autre dans ce compose : pas de base de données (le service n'en a pas), 
 
 > **Image ~1,5 Go.** `torch` est résolu depuis l'index CPU de PyTorch (`tool.uv.sources` dans `pyproject.toml`) : les roues PyPI embarquent CUDA sur Linux, soit ~4 Go de paquets `nvidia-*` pour un GPU que l'OCR n'utilise jamais (`EASYOCR_GPU=False`). Cette redirection profite aussi au venv local et à la CI.
 
+### Image de production (`Dockerfile.prod`)
+
+```bash
+docker build -f Dockerfile.prod -t factur-ia-api-ia:prod .
+docker run -e PORT=8080 -p 8080:8080 factur-ia-api-ia:prod   # + secrets via -e/--env-file
+```
+
+Destinée à Cloud Run : code figé dans l'image, uvicorn sans rechargement (un seul worker) écoutant sur `$PORT`, utilisateur non-root, aucun secret dans l'image. Les **poids EasyOCR sont cuits dans l'image** (~1,8 Go au total, bytecode précompilé compris) : rien n'est téléchargé à l'exécution, `GET /ready` est vert dès le démarrage (~0,7 s en local) et devient un contrôle d'intégrité d'image. Les langues OCR sont figées au build (`fr,en`, alignées sur le défaut `OCR_LANGUAGES`) : en changer exige un rebuild. Le monitoring MLflow pointe en production vers la base `mlflow` dédiée de l'instance Cloud SQL MySQL (`MLFLOW_TRACKING_URI`, cf. [section monitoring](#monitoring-de-la-qualité-dextraction)) : les runs survivent au recyclage des instances.
+
 ## Collecte des FAQ réglementaires (scraping)
 
 Un batch indépendant du pipeline collecte des questions-réponses publiques sur la facturation électronique (DGFiP, Le Coin des Entrepreneurs) et les agrège dans `data/faq.csv`, en vue d'un futur chatbot RAG :
@@ -74,10 +83,12 @@ Ne sont volontairement **pas** vérifiés :
 - **Groq** — jamais d'appel à un service payant depuis une sonde interrogée en continu. Surtout, se retirer du trafic parce que Groq est tombé nous priverait d'émettre les payloads d'échec : les documents resteraient bloqués « en attente » côté API data au lieu de passer proprement en « erreur ». La présence de la clé n'est pas testée non plus — `GROQ_API_KEY` est requise par la configuration, donc l'application ne démarre pas sans elle.
 - **l'API data** (destination du callback) — panne partagée, non locale. Le callback a ses propres retries, il intervient en fin de pipeline et non à l'entrée, et si l'API data est indisponible elle ne nous envoie plus rien : il n'y a aucun trafic à retirer.
 
-Limite assumée : une instance sans poids est retirée du trafic alors qu'elle traiterait encore les PDF natifs (le cas majoritaire). En production, les poids seront cuits dans l'image — le contrôle devient alors un contrôle d'intégrité d'image, toujours vert, rouge immédiatement si l'image est cassée.
+Limite assumée : une instance sans poids est retirée du trafic alors qu'elle traiterait encore les PDF natifs (le cas majoritaire). En production (`Dockerfile.prod`), les poids sont cuits dans l'image — le contrôle devient alors un contrôle d'intégrité d'image, toujours vert, rouge immédiatement si l'image est cassée.
 
 ### Configuration Cloud Run
 
+- **« CPU always allocated » est indispensable** (facturation à l'instance) : le pipeline tourne en `BackgroundTasks` **après** la réponse 202 — en facturation à la requête, le CPU est étranglé dès la réponse envoyée et l'OCR serait gelé en plein traitement.
+- **Concurrency basse (1-2)**, un seul worker uvicorn : chaque OCR est gourmand en mémoire (Reader EasyOCR ~1 Go résident + jusqu'à ~500 Mo d'images pour un scan de 20 pages, sur les 2 vCPU / 4 Go prévus) ; la montée en charge se fait horizontalement, par instances.
 - **Startup probe** sur `/health` : `periodSeconds: 10`, `failureThreshold: 6`, `timeoutSeconds: 4` — laisse ~60 s de démarrage à froid.
 - **Liveness probe** sur `/health` : `periodSeconds: 30`, `timeoutSeconds: 4`, `failureThreshold: 3`.
 - Cloud Run ne propose pas de readiness probe continue au sens Kubernetes : `/ready` sert d'*uptime check* (une alerte « instance hors trafic ») et de readiness le jour où le service tournerait sur GKE.
@@ -109,6 +120,14 @@ Désactivé par défaut. Quatre variables, toutes documentées dans `.env.exampl
 | `MONITORING_SEUIL_ALERTE` | `0.7` | Score sous lequel une extraction est signalée |
 
 **Aucun serveur n'est nécessaire pour écrire** : le store par défaut est un simple fichier SQLite local. Le serveur MLflow ne sert qu'à *relire*. Tant que `MLFLOW_ENABLED` est faux, rien n'est tracé et la bibliothèque `mlflow` n'est même pas importée — le comportement du service est strictement inchangé, en local comme en CI (les tests tournent monitoring éteint).
+
+### En production : base Cloud SQL MySQL
+
+Le disque des instances Cloud Run est éphémère : un fichier SQLite y serait perdu à chaque recyclage — tracer pour perdre est pire que ne pas tracer. En production, `MLFLOW_TRACKING_URI` pointe donc vers une base `mlflow` dédiée sur l'instance Cloud SQL MySQL déjà provisionnée pour l'application (coût nul) : `mysql+pymysql://<user>:<motdepasse>@hote:3306/mlflow`. Le pilote `pymysql` est en dépendance runtime ; le module de monitoring ne change pas, l'URI est déjà pilotée par variable d'environnement.
+
+MLflow **crée ses tables tout seul au premier usage** (migrations Alembic automatiques, aucun job d'initialisation à prévoir), à une condition : le flag Cloud SQL `log_bin_trust_function_creators=on`. Les migrations créent un trigger, que MySQL refuse à un utilisateur non-SUPER quand le journal binaire est actif (erreur 1419) — et le binlog est toujours actif sur Cloud SQL.
+
+Volumétrie mesurée : **~16 Kio par run** (15 métriques, 10 tags, index compris), soit ~16 Mio pour 1 000 extractions. MLflow n'a pas de purge native : au-delà de la durée de conservation retenue (registre RGPD), prévoir un job périodique qui supprime les runs anciens puis exécute `mlflow gc`.
 
 ### Ce qui est tracé
 
@@ -156,6 +175,8 @@ L'interface MLflow, lancée en local :
 uv run mlflow ui --backend-store-uri sqlite:///mlflow.db
 # puis http://localhost:5000
 ```
+
+Pour relire la base de production, passer à `--backend-store-uri` la même URI MySQL que le service.
 
 Trois lectures utiles :
 
