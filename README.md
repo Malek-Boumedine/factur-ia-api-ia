@@ -96,6 +96,88 @@ Limite assumée : une instance sans poids est retirée du trafic alors qu'elle t
 
 > Si une instrumentation HTTP (OpenTelemetry, Prometheus) est ajoutée plus tard, **exclure ces deux routes** : sondées en continu, elles écraseraient les statistiques de latence et de taux d'erreur du trafic réel.
 
+## Livraison continue (`.github/workflows/deploy.yml`)
+
+Workflow transposé de celui de `factur-ia-api-data` (conçu pour l'être — voir sa section « Livraison continue ») : mêmes décisions, seules les spécificités de ce dépôt changent.
+
+**Partage des responsabilités** : Terraform (dépôt `factur-ia-infra`) possède la *forme* du service Cloud Run — configuration, secrets, compte de service runtime, IAM — et pose un `ignore_changes` sur l'image (déjà en place) ; la chaîne de livraison possède son *contenu* : elle construit l'image de production, la pousse dans Artifact Registry et déploie une nouvelle révision en ne passant que `--image`. Elle ne touche jamais à l'infrastructure.
+
+**Déroulé** : à la publication d'une release GitHub (créée par le workflow Semantic Release au merge sur `main`), le workflow checkout le tag `vX.Y.Z` (le `pyproject.toml` y est déjà bumpé — l'image annonce la bonne version), construit l'image **depuis `Dockerfile.prod`** (celle qui embarque les poids EasyOCR — jamais l'image de dev) avec deux tags (`X.Y.Z` + `sha-<commit>`, pas de `latest`), la pousse, déploie la révision **par digest**, puis interroge `/health` avec un jeton d'identité (l'ingress est sous IAM) — échec du workflow si la sonde ne répond pas. Un `workflow_dispatch` permet de (re)déployer n'importe quel tag existant sans créer de release (retour arrière compris).
+
+**Ce qui diffère de l'API data** :
+
+- **Pas d'étape de migration** : ce service n'a aucun schéma applicatif. MLflow crée ses tables tout seul au premier usage (cf. [section monitoring](#en-production--base-cloud-sql-mysql)) — la seule condition, le flag Cloud SQL `log_bin_trust_function_creators=on`, est déjà posée par le Terraform. Rien à exécuter avant la bascule.
+- **Build plus long, sans cache** : l'image de production fait ~1,8 Go et télécharge les poids EasyOCR au build (~10-15 min à froid, très loin des limites GitHub Actions). Un cache de couches (buildx + cache GitHub Actions) économiserait 5 à 8 min, mais s'évince après 7 jours d'inutilisation : à la cadence des releases il serait froid la plupart du temps — complexité écartée, à reconsidérer si la durée devient gênante.
+
+### Variables GitHub à configurer
+
+Aucun secret : avec la fédération d'identité, rien de confidentiel n'est stocké. Tout va dans les **variables de dépôt** (Settings → Secrets and variables → Actions → Variables) :
+
+| Variable | Contenu | Exemple |
+|---|---|---|
+| `GCP_WORKLOAD_IDENTITY_PROVIDER` | Nom complet du provider WIF (sortie Terraform `wif_provider_name`) | `projects/1234567890/locations/global/workloadIdentityPools/github-actions/providers/github-oidc` |
+| `GCP_DEPLOY_SA` | Email du compte de service de déploiement de **ce** dépôt | `github-deployer-api-ia@<projet>.iam.gserviceaccount.com` |
+| `GCP_PROJECT_ID` | ID du projet GCP | `factur-ia-prod` |
+| `GCP_REGION` | Région Cloud Run / Artifact Registry | `europe-west9` |
+| `ARTIFACT_REGISTRY_REPO` | Nom du dépôt Artifact Registry | `factur-ia` |
+| `CLOUD_RUN_SERVICE` | Nom du service Cloud Run (aussi utilisé comme nom d'image) | `factur-ia-api-ia` |
+
+### Prérequis côté infrastructure (Terraform, dépôt `factur-ia-infra`)
+
+Le pool et le provider WIF sont **partagés par les trois dépôts** et déjà décrits pour l'API data — ne pas les recréer. Ce dépôt n'apporte que son compte de service de déploiement, sa liaison restreinte à lui seul, et ses rôles sur *son* service (sans liaison de job de migration, il n'y en a pas) :
+
+```hcl
+# ── Compte de service de déploiement de factur-ia-api-ia ─────────────────────
+
+resource "google_service_account" "github_deployer_api_ia" {
+  account_id   = "github-deployer-api-ia"
+  display_name = "CD GitHub Actions — factur-ia-api-ia"
+}
+
+# Seul le dépôt factur-ia-api-ia peut emprunter ce compte de service.
+resource "google_service_account_iam_member" "deployer_api_ia_wif" {
+  service_account_id = google_service_account.github_deployer_api_ia.name
+  role               = "roles/iam.workloadIdentityUser"
+  member             = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.github.name}/attribute.repository/Malek-Boumedine/factur-ia-api-ia"
+}
+
+# ── Rôles du compte de déploiement (moindre privilège) ───────────────────────
+
+# Pousser l'image.
+resource "google_artifact_registry_repository_iam_member" "deployer_api_ia_push" {
+  location   = var.region
+  repository = google_artifact_registry_repository.images.repository_id
+  role       = "roles/artifactregistry.writer"
+  member     = "serviceAccount:${google_service_account.github_deployer_api_ia.email}"
+}
+
+# Déployer une révision — pas run.admin : le workflow ne doit pas pouvoir
+# modifier l'IAM du service.
+resource "google_cloud_run_v2_service_iam_member" "deployer_api_ia_developer" {
+  location = var.region
+  name     = google_cloud_run_v2_service.api_ia.name
+  role     = "roles/run.developer"
+  member   = "serviceAccount:${google_service_account.github_deployer_api_ia.email}"
+}
+
+# Appeler /health après déploiement (l'ingress est sous IAM).
+resource "google_cloud_run_v2_service_iam_member" "deployer_api_ia_invoker" {
+  location = var.region
+  name     = google_cloud_run_v2_service.api_ia.name
+  role     = "roles/run.invoker"
+  member   = "serviceAccount:${google_service_account.github_deployer_api_ia.email}"
+}
+
+# Déployer une révision qui s'exécute sous l'identité du SA runtime du service.
+resource "google_service_account_iam_member" "deployer_api_ia_actas_runtime" {
+  service_account_id = google_service_account.api_ia.name
+  role               = "roles/iam.serviceAccountUser"
+  member             = "serviceAccount:${google_service_account.github_deployer_api_ia.email}"
+}
+```
+
+Divergence cosmétique à harmoniser côté infra : le workflow nomme l'image d'après `CLOUD_RUN_SERVICE` (`factur-ia-api-ia`), alors que des exemples manuels du README infra utilisaient `api-ia` — c'est la convention du workflow qui fait foi.
+
 ## Monitoring de la qualité d'extraction
 
 ### À quoi ça sert
