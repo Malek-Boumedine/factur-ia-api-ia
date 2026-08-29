@@ -68,6 +68,14 @@ dev = [
     # (`uv run mlflow ui`). Le service, lui, n'a besoin que de `mlflow-skinny`.
     "mlflow>=3.0",
 ]
+# POC de recherche sémantique sur la FAQ réglementaire (src/recherche/) —
+# volontairement hors des dépendances runtime : les images Docker font
+# `uv sync --no-dev`, qui n'installe pas les groupes non par défaut, donc rien
+# de tout ceci (ni le modèle d'embeddings) n'entre dans l'image de production.
+poc = [
+    "sentence-transformers>=5.0",
+    "streamlit>=1.40",
+]
 test = [
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
