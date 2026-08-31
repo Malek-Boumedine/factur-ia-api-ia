@@ -1,42 +1,50 @@
-"""Monitoring de la qualité d'extraction : un run MLflow par extraction.
+"""Monitoring de la qualité d'extraction : MLflow (diagnostic) + Prometheus (alerte).
 
-Module transverse (pendant du ``core/telemetry.py`` de l'API data, qui couvre lui
-le monitoring *applicatif*). Ici on ne surveille pas « est-ce que l'app tourne ? »
-mais « est-ce que le modèle d'extraction répond bien ? » : on trace dans le temps
-les signaux de qualité que le pipeline produit déjà (score de confiance global,
-confiance par champ, type de document suggéré, succès/échec), pour suivre la
-qualité, détecter une dérive et la restituer.
+Module transverse, point d'entrée unique du monitoring qualité
+(``track_extraction_quality``, appelée une fois par le pipeline). Ici on ne
+surveille pas « est-ce que l'app tourne ? » (c'est le rôle des métriques HTTP
+de ``core/telemetry.py``) mais « est-ce que le modèle d'extraction répond
+bien ? » : on trace dans le temps les signaux de qualité que le pipeline
+produit déjà (score de confiance global, confiance par champ, type de document
+suggéré, succès/échec), pour suivre la qualité, détecter une dérive, la
+restituer — et alerter dessus.
 
-Pourquoi MLflow plutôt que Prometheus : c'est l'outil de suivi *de modèle*, et il
-sait ce qu'un système de métriques ne sait pas faire — attacher à chaque
-extraction son identifiant et le **nom du modèle LLM utilisé**, donc répondre à
-« le score a-t-il chuté quand j'ai changé de modèle ? ». En écriture il n'exige
-aucun serveur : le store par défaut est un simple fichier SQLite local
-(``MLFLOW_TRACKING_URI="sqlite:///mlflow.db"``) ; l'interface ne sert qu'à
-*relire*.
+Deux sorties complémentaires, chacune derrière son propre interrupteur, qui
+répondent à des questions différentes :
+
+- **MLflow** (``MLFLOW_ENABLED``) : un run par extraction, pour le
+  *diagnostic*. Il attache à chaque extraction son ``id_document`` et le **nom
+  du modèle LLM utilisé**, donc répond à « le score a-t-il chuté quand j'ai
+  changé de modèle ? » et « quel document se cache derrière ce run dégradé ? ».
+  En écriture il n'exige aucun serveur : le store par défaut est un simple
+  fichier SQLite local (``MLFLOW_TRACKING_URI="sqlite:///mlflow.db"``) ;
+  l'interface ne sert qu'à *relire*. Un score sous ``MONITORING_SEUIL_ALERTE``
+  déclenche un ``WARNING`` applicatif et pose le tag ``alerte=true`` sur le
+  run (extractions dégradées filtrables en un clic).
+- **Prometheus** (``OTEL_METRICS_ENABLED``, via
+  ``telemetry.record_extraction_quality``) : des agrégats sans identifiant,
+  pour l'*alerte*. MLflow ne sait pas alerter ; les métriques exposées sur
+  ``/metrics`` sont scrapables par une stack Prometheus/Grafana, où vivront
+  les règles d'alerte (dégradation du score moyen, taux d'échec élevé).
 
 Deux garanties, dans cet ordre de priorité :
 
-1. **Le monitoring ne casse jamais l'extraction.** Traçage désactivé → retour
-   immédiat, ``mlflow`` n'est même pas importé (import paresseux dans
-   ``_log_run``) : coût strictement nul et comportement inchangé, en local comme
-   en CI. Traçage actif → tout le corps est sous un ``try/except Exception`` qui
-   journalise en ``WARNING`` et n'ose rien remonter. Disque plein, store
-   illisible, bug du client MLflow : l'appelant ne le voit pas passer.
+1. **Le monitoring ne casse jamais l'extraction.** Sortie désactivée → no-op
+   (``mlflow`` n'est même pas importé — import paresseux dans ``_log_run`` —
+   et les instruments Prometheus valent ``None``) : coût strictement nul et
+   comportement inchangé, en local comme en CI. Sortie active → chaque bloc
+   est sous son propre ``try/except Exception`` qui journalise en ``WARNING``
+   et n'ose rien remonter ; l'échec de l'une n'empêche pas l'autre. Disque
+   plein, store illisible, bug d'un client : l'appelant ne le voit pas passer.
 2. **Aucune donnée sensible ne sort d'ici.** Le contenu tracé est construit
    depuis une **liste blanche explicite** (``TRACKED_FIELDS`` pour les
    confiances, dictionnaires littéraux pour le reste) : on ne sérialise jamais
    le payload, on n'itère jamais sur ses champs. Ne partent que des agrégats —
    des nombres entre 0 et 1, une durée, des étiquettes catégorielles à valeurs
-   bornées, l'``id_document``. Ne partent **jamais** : texte brut du document,
-   SIRET, IBAN, numéro de facture, montants, dates, désignations de lignes, nom
-   de fichier, ni aucun secret.
-
-Compromis assumé — **l'alerte**. MLflow ne sait pas alerter. À défaut, un score
-sous ``MONITORING_SEUIL_ALERTE`` déclenche ici un ``WARNING`` applicatif *et*
-pose le tag ``alerte=true`` sur le run, qui rend les extractions dégradées
-filtrables en un clic dans l'interface. C'est le vecteur d'alerte du service ;
-une vraie règle d'alerting (Grafana) viendra avec la centralisation des logs.
+   bornées, l'``id_document`` (MLflow uniquement — jamais en label Prometheus,
+   cardinalité non bornée). Ne partent **jamais** : texte brut du document,
+   SIRET, IBAN, numéro de facture, montants, dates, désignations de lignes,
+   nom de fichier, ni aucun secret.
 """
 
 import logging
@@ -45,6 +53,7 @@ from enum import StrEnum
 from typing import Final
 
 from src.callback.schemas import OcrWebhookPayload
+from src.core import telemetry
 from src.core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -226,18 +235,47 @@ def _log_run(
         mlflow.log_metrics(_build_metrics(payload, duree_secondes))
 
 
+def _record_metrics(
+    payload: OcrWebhookPayload,
+    mode_extraction: ModeExtraction,
+    duree_secondes: float,
+) -> None:
+    """Alimente les métriques Prometheus de qualité (appelé sous protection).
+
+    Traduit le payload en agrégats et étiquettes bornées pour
+    ``telemetry.record_extraction_quality`` — no-op tant que les métriques ne
+    sont pas activées. Sur un échec, score et taux sont omis (``None``) : le
+    score conventionnel à 0 fausserait la moyenne de l'histogramme alors que le
+    compteur par ``statut`` porte déjà le signal d'échec — deux alertes
+    indépendantes (dérive de qualité vs pannes).
+    """
+    succes = payload.score_confiance > 0
+    telemetry.record_extraction_quality(
+        statut="succes" if succes else "echec",
+        type_document=payload.type_document or _TYPE_NON_CALCULE,
+        mode_extraction=mode_extraction.value,
+        score_confiance=float(payload.score_confiance) if succes else None,
+        taux_champs_reconnus=(
+            taux_champs_reconnus(payload.par_champ) if succes else None
+        ),
+        duree_secondes=duree_secondes,
+    )
+
+
 def track_extraction_quality(
     payload: OcrWebhookPayload,
     *,
     mode_extraction: ModeExtraction,
     duree_secondes: float,
 ) -> None:
-    """Trace la qualité d'une extraction — succès comme échec — dans MLflow.
+    """Trace la qualité d'une extraction — succès comme échec.
 
     Point d'entrée unique du monitoring qualité : le pipeline l'appelle une
-    fois, après l'envoi au callback. Ne lève jamais, ne bloque jamais l'appelant
-    (cf. les deux garanties en tête de module) et ne fait rien du tout tant que
-    ``MLFLOW_ENABLED`` est faux.
+    fois, après l'envoi au callback. Deux sorties indépendantes, chacune
+    derrière son interrupteur (cf. docstring de module) : les métriques
+    Prometheus (``OTEL_METRICS_ENABLED``, pour l'alerte) et le run MLflow
+    (``MLFLOW_ENABLED``, pour le diagnostic). Ne lève jamais, ne bloque jamais
+    l'appelant, et ne fait rien du tout tant qu'aucune sortie n'est activée.
 
     Args:
         payload: résultat d'extraction déjà envoyé à l'API data. Lu seulement —
@@ -245,6 +283,17 @@ def track_extraction_quality(
         mode_extraction: chemin d'extraction emprunté (PDF natif, OCR, inconnu).
         duree_secondes: durée du pipeline complet, callback compris.
     """
+    try:
+        _record_metrics(payload, mode_extraction, duree_secondes)
+    except Exception:
+        # Même règle que MLflow ci-dessous : un enregistrement en échec n'est
+        # qu'une perte d'observabilité, jamais une erreur fonctionnelle.
+        logger.warning(
+            "Document %s — enregistrement des métriques Prometheus échoué, ignoré.",
+            payload.id_document,
+            exc_info=True,
+        )
+
     if not settings.MLFLOW_ENABLED:
         return
 

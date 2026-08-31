@@ -27,6 +27,9 @@ repos:
           - fastapi
           - "pydantic>=2.10"
           - "pydantic-settings>=2.7"
+          # Même borne que pyproject.toml : une version différente ici ferait
+          # juger autrement les `type: ignore` ciblés sur google-auth.
+          - "google-auth>=2.57.0"
 
   - repo: https://github.com/Yelp/detect-secrets
     rev: v1.5.0

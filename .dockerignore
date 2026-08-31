@@ -17,6 +17,13 @@ __pycache__/
 mlflow.db
 mlruns/
 
+# Tests, données du scraping, logs et sorties d'outillage : rien à faire en
+# production (sans effet sur l'image de dev, où le code est monté en volume).
+tests/
+data/
+logs/
+graphify-out/
+
 # Poids OCR qui traîneraient à la racine : fournis par un volume.
 *.pth
 .EasyOCR/
