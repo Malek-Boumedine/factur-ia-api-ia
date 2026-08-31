@@ -1,6 +1,6 @@
 [project]
 name = "factur-ia-api-ia"
-version = "1.4.0"
+version = "1.5.0"
 description = "Microservice IA d'extraction de factures (OCR + LLM) pour le système Factur-IA"
 readme = "README.md"
 requires-python = ">=3.13"
@@ -11,6 +11,11 @@ dependencies = [
     "pydantic>=2.10",
     "pydantic-settings>=2.7",
     "httpx>=0.28",
+    # Jeton d'identité Google du callback vers l'API data derrière IAM Cloud Run
+    # (core/gcp_identity.py). Même borne que l'API data ET que le hook mypy de
+    # .pre-commit-config.yaml : les garder alignées, sinon le hook voit une
+    # autre version et juge différemment les `type: ignore` ciblés.
+    "google-auth>=2.57.0",
     "loguru>=0.7",
     "pdfplumber>=0.11",
     "easyocr>=1.7",
@@ -29,7 +34,18 @@ dependencies = [
     # migrations mais ne déclare pas ces deux dépendances, à fournir nous-mêmes.
     "sqlalchemy>=2.0",
     "alembic>=1.13",
+    # Pilote MySQL du tracking MLflow en production (Cloud SQL, cf. README) :
+    # URI `mysql+pymysql://...`. Même pilote que le client Django.
+    "pymysql>=1.2.0",
     "beautifulsoup4>=4.15.0",
+    # Observabilité OpenTelemetry (mêmes bornes que l'API data) : traces OTLP et
+    # métriques Prometheus, désactivées par défaut. Tout est pur Python, quelques
+    # Mo au total — sans effet notable sur le poids de l'image.
+    "opentelemetry-exporter-otlp-proto-http>=1.44.0",
+    "opentelemetry-exporter-prometheus>=0.65b0",
+    "opentelemetry-instrumentation-fastapi>=0.65b0",
+    "opentelemetry-instrumentation-httpx>=0.65b0",
+    "opentelemetry-sdk>=1.44.0",
 ]
 
 # EasyOCR tire torch, dont les roues PyPI embarquent CUDA sur Linux (37 paquets
@@ -56,6 +72,14 @@ dev = [
     # MLflow complet : uniquement pour l'interface de restitution locale
     # (`uv run mlflow ui`). Le service, lui, n'a besoin que de `mlflow-skinny`.
     "mlflow>=3.0",
+]
+# POC de recherche sémantique sur la FAQ réglementaire (src/recherche/) —
+# volontairement hors des dépendances runtime : les images Docker font
+# `uv sync --no-dev`, qui n'installe pas les groupes non par défaut, donc rien
+# de tout ceci (ni le modèle d'embeddings) n'entre dans l'image de production.
+poc = [
+    "sentence-transformers>=5.0",
+    "streamlit>=1.40",
 ]
 test = [
     "pytest>=8.3",

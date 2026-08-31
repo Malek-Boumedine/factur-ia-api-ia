@@ -41,6 +41,12 @@ class Settings(BaseSettings):
     DATA_API_BASE_URL: Requis
     HTTP_TIMEOUT_SECONDS: float = 30.0
     HTTP_MAX_RETRIES: int = 3
+    # Authentification IAM Cloud Run du callback (jeton d'identité Google dans
+    # X-Serverless-Authorization, cf. core/gcp_identity.py). Symétrique de
+    # IA_API_IAM_AUTH_ENABLED côté API data : chaque service nomme le service
+    # appelé. Défaut faux : en dev/test, l'API data locale n'exige aucun jeton
+    # et il n'y a pas de serveur de métadonnées.
+    DATA_API_IAM_AUTH_ENABLED: bool = False
 
     # --- LLM Groq ---
     GROQ_API_KEY: Requis
@@ -54,6 +60,27 @@ class Settings(BaseSettings):
 
     # --- CORS ---
     CORS_ORIGINS: str = "*"
+
+    # --- Observabilité (OpenTelemetry) ---
+    # Deux interrupteurs indépendants, désactivés par défaut : rien n'est
+    # instrumenté en local ni en CI. OTEL_ENABLED pilote les traces (export
+    # OTLP), OTEL_METRICS_ENABLED les métriques — dont celles de qualité
+    # d'extraction — exposées sur /metrics au format Prometheus (jamais public
+    # en production). (Noms maison, alignés sur l'API data : la variable
+    # standard OTEL_SDK_DISABLED a une sémantique inversée avec défaut =
+    # activé.) Les autres variables suivent les conventions standard
+    # OpenTelemetry ; le SDK les lit dans os.environ, pas dans le .env —
+    # setup_telemetry les y relaie, l'environnement réel restant prioritaire.
+    OTEL_ENABLED: bool = False
+    OTEL_METRICS_ENABLED: bool = False
+    OTEL_SERVICE_NAME: str = "factur-ia-api-ia"
+    OTEL_EXPORTER_OTLP_ENDPOINT: str | None = None
+    OTEL_TRACES_EXPORTER: str = "otlp"
+    OTEL_TRACES_SAMPLER: str | None = None
+    OTEL_TRACES_SAMPLER_ARG: str | None = None
+    # Conventions sémantiques HTTP stables : requises pour le label
+    # http.route des métriques (découpage par route).
+    OTEL_SEMCONV_STABILITY_OPT_IN: str = "http"
 
     # --- Monitoring de la qualité d'extraction (MLflow) ---
     # Désactivé par défaut, comme les interrupteurs d'observabilité de l'API data :

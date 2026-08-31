@@ -2,6 +2,50 @@
 
 <!-- version list -->
 
+## v1.5.0 (2026-08-08)
+
+### Bug Fixes
+
+- **config**: Refuse une valeur vide pour les variables requises
+  ([`5ae1e1c`](https://github.com/Malek-Boumedine/factur-ia-api-ia/commit/5ae1e1c0735a32da9ef57a3dea643045410e9fe3))
+
+- **extractions**: Remplace la constante 413 dépréciée par Starlette
+  ([`8d5ccc0`](https://github.com/Malek-Boumedine/factur-ia-api-ia/commit/8d5ccc0a01be9232f39ac15fe94e0fece4971351))
+
+### Documentation
+
+- Reformatage des fichiers README général et README du module scraping
+  ([`eeb0288`](https://github.com/Malek-Boumedine/factur-ia-api-ia/commit/eeb028857b6681d0448c29db80cc909456ea3555))
+
+### Features
+
+- **extractions**: Expose la confiance par champ et le type de document dans le callback
+  ([`6d1b400`](https://github.com/Malek-Boumedine/factur-ia-api-ia/commit/6d1b400ad0e98f68e88f7faa79ee423fc952521b))
+
+- **extractions**: Extrait la date d'échéance des factures
+  ([`b6ac91e`](https://github.com/Malek-Boumedine/factur-ia-api-ia/commit/b6ac91e557874d717a72cc51d98593d3a8fb05a0))
+
+- **infra**: Conteneurise l'API IA pour le développement local
+  ([`d9d2c9d`](https://github.com/Malek-Boumedine/factur-ia-api-ia/commit/d9d2c9d64e7c0bdcfc21b390a990f6a7f62c497b))
+
+- **infra**: Sondes de disponibilité /health et /ready pour Cloud Run
+  ([`308d16c`](https://github.com/Malek-Boumedine/factur-ia-api-ia/commit/308d16c3bf27450d38f8d42d638107e96ef403a9))
+
+- **monitoring**: Suit la qualité des extractions avec MLflow
+  ([`3345a30`](https://github.com/Malek-Boumedine/factur-ia-api-ia/commit/3345a30e13439ef90bedc6d814e774417b9038fe))
+
+- **scraping**: Collecte des FAQ officielles sur la facturation électronique
+  ([`0d04c85`](https://github.com/Malek-Boumedine/factur-ia-api-ia/commit/0d04c85fcc0e286008b58c57216c67950cb244cb))
+
+- **scraping**: Orchestration de la collecte et sauvegarde du jeu de données
+  ([`7f10564`](https://github.com/Malek-Boumedine/factur-ia-api-ia/commit/7f1056455c2c964cd4fb99ac84058db65ce412fd))
+
+### Testing
+
+- **extractions**: Couvre le pipeline de bout en bout sur documents d'exemple
+  ([`7f22c86`](https://github.com/Malek-Boumedine/factur-ia-api-ia/commit/7f22c8605c03af0a024a433b61fba31d288b723f))
+
+
 ## v1.4.0 (2026-07-27)
 
 ### Bug Fixes

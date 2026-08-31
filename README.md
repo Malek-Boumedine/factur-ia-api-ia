@@ -36,6 +36,15 @@ Rien d'autre dans ce compose : pas de base de données (le service n'en a pas), 
 
 > **Image ~1,5 Go.** `torch` est résolu depuis l'index CPU de PyTorch (`tool.uv.sources` dans `pyproject.toml`) : les roues PyPI embarquent CUDA sur Linux, soit ~4 Go de paquets `nvidia-*` pour un GPU que l'OCR n'utilise jamais (`EASYOCR_GPU=False`). Cette redirection profite aussi au venv local et à la CI.
 
+### Image de production (`Dockerfile.prod`)
+
+```bash
+docker build -f Dockerfile.prod -t factur-ia-api-ia:prod .
+docker run -e PORT=8080 -p 8080:8080 factur-ia-api-ia:prod   # + secrets via -e/--env-file
+```
+
+Destinée à Cloud Run : code figé dans l'image, uvicorn sans rechargement (un seul worker) écoutant sur `$PORT`, utilisateur non-root, aucun secret dans l'image. Les **poids EasyOCR sont cuits dans l'image** (~1,8 Go au total, bytecode précompilé compris) : rien n'est téléchargé à l'exécution, `GET /ready` est vert dès le démarrage (~0,7 s en local) et devient un contrôle d'intégrité d'image. Les langues OCR sont figées au build (`fr,en`, alignées sur le défaut `OCR_LANGUAGES`) : en changer exige un rebuild. Le monitoring MLflow pointe en production vers la base `mlflow` dédiée de l'instance Cloud SQL MySQL (`MLFLOW_TRACKING_URI`, cf. [section monitoring](#monitoring-de-la-qualité-dextraction)) : les runs survivent au recyclage des instances.
+
 ## Collecte des FAQ réglementaires (scraping)
 
 Un batch indépendant du pipeline collecte des questions-réponses publiques sur la facturation électronique (DGFiP, Le Coin des Entrepreneurs) et les agrège dans `data/faq.csv`, en vue d'un futur chatbot RAG :
@@ -74,16 +83,100 @@ Ne sont volontairement **pas** vérifiés :
 - **Groq** — jamais d'appel à un service payant depuis une sonde interrogée en continu. Surtout, se retirer du trafic parce que Groq est tombé nous priverait d'émettre les payloads d'échec : les documents resteraient bloqués « en attente » côté API data au lieu de passer proprement en « erreur ». La présence de la clé n'est pas testée non plus — `GROQ_API_KEY` est requise par la configuration, donc l'application ne démarre pas sans elle.
 - **l'API data** (destination du callback) — panne partagée, non locale. Le callback a ses propres retries, il intervient en fin de pipeline et non à l'entrée, et si l'API data est indisponible elle ne nous envoie plus rien : il n'y a aucun trafic à retirer.
 
-Limite assumée : une instance sans poids est retirée du trafic alors qu'elle traiterait encore les PDF natifs (le cas majoritaire). En production, les poids seront cuits dans l'image — le contrôle devient alors un contrôle d'intégrité d'image, toujours vert, rouge immédiatement si l'image est cassée.
+Limite assumée : une instance sans poids est retirée du trafic alors qu'elle traiterait encore les PDF natifs (le cas majoritaire). En production (`Dockerfile.prod`), les poids sont cuits dans l'image — le contrôle devient alors un contrôle d'intégrité d'image, toujours vert, rouge immédiatement si l'image est cassée.
 
 ### Configuration Cloud Run
 
+- **« CPU always allocated » est indispensable** (facturation à l'instance) : le pipeline tourne en `BackgroundTasks` **après** la réponse 202 — en facturation à la requête, le CPU est étranglé dès la réponse envoyée et l'OCR serait gelé en plein traitement.
+- **Concurrency basse (1-2)**, un seul worker uvicorn : chaque OCR est gourmand en mémoire (Reader EasyOCR ~1 Go résident + jusqu'à ~500 Mo d'images pour un scan de 20 pages, sur les 2 vCPU / 4 Go prévus) ; la montée en charge se fait horizontalement, par instances.
 - **Startup probe** sur `/health` : `periodSeconds: 10`, `failureThreshold: 6`, `timeoutSeconds: 4` — laisse ~60 s de démarrage à froid.
 - **Liveness probe** sur `/health` : `periodSeconds: 30`, `timeoutSeconds: 4`, `failureThreshold: 3`.
 - Cloud Run ne propose pas de readiness probe continue au sens Kubernetes : `/ready` sert d'*uptime check* (une alerte « instance hors trafic ») et de readiness le jour où le service tournerait sur GKE.
 - Le répertoire des poids EasyOCR se pilote par `EASYOCR_MODULE_PATH` (défaut `~/.EasyOCR/`), utile pour pointer un volume ou l'emplacement choisi dans l'image.
 
 > Si une instrumentation HTTP (OpenTelemetry, Prometheus) est ajoutée plus tard, **exclure ces deux routes** : sondées en continu, elles écraseraient les statistiques de latence et de taux d'erreur du trafic réel.
+
+## Livraison continue (`.github/workflows/deploy.yml`)
+
+Workflow transposé de celui de `factur-ia-api-data` (conçu pour l'être — voir sa section « Livraison continue ») : mêmes décisions, seules les spécificités de ce dépôt changent.
+
+**Partage des responsabilités** : Terraform (dépôt `factur-ia-infra`) possède la *forme* du service Cloud Run — configuration, secrets, compte de service runtime, IAM — et pose un `ignore_changes` sur l'image (déjà en place) ; la chaîne de livraison possède son *contenu* : elle construit l'image de production, la pousse dans Artifact Registry et déploie une nouvelle révision en ne passant que `--image`. Elle ne touche jamais à l'infrastructure.
+
+**Déroulé** : à la publication d'une release GitHub (créée par le workflow Semantic Release au merge sur `main`), le workflow checkout le tag `vX.Y.Z` (le `pyproject.toml` y est déjà bumpé — l'image annonce la bonne version), construit l'image **depuis `Dockerfile.prod`** (celle qui embarque les poids EasyOCR — jamais l'image de dev) avec deux tags (`X.Y.Z` + `sha-<commit>`, pas de `latest`), la pousse, déploie la révision **par digest**, puis interroge `/health` avec un jeton d'identité (l'ingress est sous IAM) — échec du workflow si la sonde ne répond pas. Un `workflow_dispatch` permet de (re)déployer n'importe quel tag existant sans créer de release (retour arrière compris).
+
+**Ce qui diffère de l'API data** :
+
+- **Pas d'étape de migration** : ce service n'a aucun schéma applicatif. MLflow crée ses tables tout seul au premier usage (cf. [section monitoring](#en-production--base-cloud-sql-mysql)) — la seule condition, le flag Cloud SQL `log_bin_trust_function_creators=on`, est déjà posée par le Terraform. Rien à exécuter avant la bascule.
+- **Build plus long, sans cache** : l'image de production fait ~1,8 Go et télécharge les poids EasyOCR au build (~10-15 min à froid, très loin des limites GitHub Actions). Un cache de couches (buildx + cache GitHub Actions) économiserait 5 à 8 min, mais s'évince après 7 jours d'inutilisation : à la cadence des releases il serait froid la plupart du temps — complexité écartée, à reconsidérer si la durée devient gênante.
+
+### Variables GitHub à configurer
+
+Aucun secret : avec la fédération d'identité, rien de confidentiel n'est stocké. Tout va dans les **variables de dépôt** (Settings → Secrets and variables → Actions → Variables) :
+
+| Variable | Contenu | Exemple |
+|---|---|---|
+| `GCP_WORKLOAD_IDENTITY_PROVIDER` | Nom complet du provider WIF (sortie Terraform `wif_provider_name`) | `projects/1234567890/locations/global/workloadIdentityPools/github-actions/providers/github-oidc` |
+| `GCP_DEPLOY_SA` | Email du compte de service de déploiement de **ce** dépôt | `github-deployer-api-ia@<projet>.iam.gserviceaccount.com` |
+| `GCP_PROJECT_ID` | ID du projet GCP | `factur-ia-prod` |
+| `GCP_REGION` | Région Cloud Run / Artifact Registry | `europe-west9` |
+| `ARTIFACT_REGISTRY_REPO` | Nom du dépôt Artifact Registry | `factur-ia` |
+| `CLOUD_RUN_SERVICE` | Nom du service Cloud Run (aussi utilisé comme nom d'image) | `factur-ia-api-ia` |
+
+### Prérequis côté infrastructure (Terraform, dépôt `factur-ia-infra`)
+
+Le pool et le provider WIF sont **partagés par les trois dépôts** et déjà décrits pour l'API data — ne pas les recréer. Ce dépôt n'apporte que son compte de service de déploiement, sa liaison restreinte à lui seul, et ses rôles sur *son* service (sans liaison de job de migration, il n'y en a pas) :
+
+```hcl
+# ── Compte de service de déploiement de factur-ia-api-ia ─────────────────────
+
+resource "google_service_account" "github_deployer_api_ia" {
+  account_id   = "github-deployer-api-ia"
+  display_name = "CD GitHub Actions — factur-ia-api-ia"
+}
+
+# Seul le dépôt factur-ia-api-ia peut emprunter ce compte de service.
+resource "google_service_account_iam_member" "deployer_api_ia_wif" {
+  service_account_id = google_service_account.github_deployer_api_ia.name
+  role               = "roles/iam.workloadIdentityUser"
+  member             = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.github.name}/attribute.repository/Malek-Boumedine/factur-ia-api-ia"
+}
+
+# ── Rôles du compte de déploiement (moindre privilège) ───────────────────────
+
+# Pousser l'image.
+resource "google_artifact_registry_repository_iam_member" "deployer_api_ia_push" {
+  location   = var.region
+  repository = google_artifact_registry_repository.images.repository_id
+  role       = "roles/artifactregistry.writer"
+  member     = "serviceAccount:${google_service_account.github_deployer_api_ia.email}"
+}
+
+# Déployer une révision — pas run.admin : le workflow ne doit pas pouvoir
+# modifier l'IAM du service.
+resource "google_cloud_run_v2_service_iam_member" "deployer_api_ia_developer" {
+  location = var.region
+  name     = google_cloud_run_v2_service.api_ia.name
+  role     = "roles/run.developer"
+  member   = "serviceAccount:${google_service_account.github_deployer_api_ia.email}"
+}
+
+# Appeler /health après déploiement (l'ingress est sous IAM).
+resource "google_cloud_run_v2_service_iam_member" "deployer_api_ia_invoker" {
+  location = var.region
+  name     = google_cloud_run_v2_service.api_ia.name
+  role     = "roles/run.invoker"
+  member   = "serviceAccount:${google_service_account.github_deployer_api_ia.email}"
+}
+
+# Déployer une révision qui s'exécute sous l'identité du SA runtime du service.
+resource "google_service_account_iam_member" "deployer_api_ia_actas_runtime" {
+  service_account_id = google_service_account.api_ia.name
+  role               = "roles/iam.serviceAccountUser"
+  member             = "serviceAccount:${google_service_account.github_deployer_api_ia.email}"
+}
+```
+
+Divergence cosmétique à harmoniser côté infra : le workflow nomme l'image d'après `CLOUD_RUN_SERVICE` (`factur-ia-api-ia`), alors que des exemples manuels du README infra utilisaient `api-ia` — c'est la convention du workflow qui fait foi.
 
 ## Monitoring de la qualité d'extraction
 
@@ -109,6 +202,14 @@ Désactivé par défaut. Quatre variables, toutes documentées dans `.env.exampl
 | `MONITORING_SEUIL_ALERTE` | `0.7` | Score sous lequel une extraction est signalée |
 
 **Aucun serveur n'est nécessaire pour écrire** : le store par défaut est un simple fichier SQLite local. Le serveur MLflow ne sert qu'à *relire*. Tant que `MLFLOW_ENABLED` est faux, rien n'est tracé et la bibliothèque `mlflow` n'est même pas importée — le comportement du service est strictement inchangé, en local comme en CI (les tests tournent monitoring éteint).
+
+### En production : base Cloud SQL MySQL
+
+Le disque des instances Cloud Run est éphémère : un fichier SQLite y serait perdu à chaque recyclage — tracer pour perdre est pire que ne pas tracer. En production, `MLFLOW_TRACKING_URI` pointe donc vers une base `mlflow` dédiée sur l'instance Cloud SQL MySQL déjà provisionnée pour l'application (coût nul) : `mysql+pymysql://<user>:<motdepasse>@hote:3306/mlflow`. Le pilote `pymysql` est en dépendance runtime ; le module de monitoring ne change pas, l'URI est déjà pilotée par variable d'environnement.
+
+MLflow **crée ses tables tout seul au premier usage** (migrations Alembic automatiques, aucun job d'initialisation à prévoir), à une condition : le flag Cloud SQL `log_bin_trust_function_creators=on`. Les migrations créent un trigger, que MySQL refuse à un utilisateur non-SUPER quand le journal binaire est actif (erreur 1419) — et le binlog est toujours actif sur Cloud SQL.
+
+Volumétrie mesurée : **~16 Kio par run** (15 métriques, 10 tags, index compris), soit ~16 Mio pour 1 000 extractions. MLflow n'a pas de purge native : au-delà de la durée de conservation retenue (registre RGPD), prévoir un job périodique qui supprime les runs anciens puis exécute `mlflow gc`.
 
 ### Ce qui est tracé
 
@@ -156,6 +257,8 @@ L'interface MLflow, lancée en local :
 uv run mlflow ui --backend-store-uri sqlite:///mlflow.db
 # puis http://localhost:5000
 ```
+
+Pour relire la base de production, passer à `--backend-store-uri` la même URI MySQL que le service.
 
 Trois lectures utiles :
 

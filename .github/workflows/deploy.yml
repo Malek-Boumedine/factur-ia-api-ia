@@ -1,0 +1,169 @@
+name: Deploy Cloud Run
+
+# Livraison continue vers Cloud Run — transposé du workflow de factur-ia-api-data
+# (même conception, mêmes décisions ; voir la note « Transposer aux autres
+# dépôts » de son README).
+#
+# Périmètre strict : construire l'image de production, la pousser dans Artifact
+# Registry, déployer une nouvelle révision. L'infrastructure (forme du service,
+# secrets, scaling, IAM) appartient à Terraform, qui pose un ignore_changes sur
+# l'image pour que les deux ne se marchent pas dessus. Ce workflow ne passe donc
+# JAMAIS autre chose que --image.
+#
+# Différences avec l'API data :
+#   - build depuis Dockerfile.prod (ce dépôt a deux images : dev et production,
+#     cette dernière embarque les poids EasyOCR — build à froid ~10-15 min,
+#     assumé sans cache de couches : les déploiements suivent la cadence des
+#     releases, un cache GitHub Actions évincé après 7 jours serait froid la
+#     plupart du temps) ;
+#   - PAS d'étape de migration : ce service n'a aucun schéma applicatif, et
+#     MLflow crée ses tables tout seul au premier usage (cf. README, section
+#     monitoring) — rien à exécuter avant la bascule.
+#
+# Déclencheurs :
+#   - release published : émise par le workflow Semantic Release après le merge
+#     sur main (son PAT déclenche bien les workflows, contrairement au
+#     GITHUB_TOKEN). On checkout le tag vX.Y.Z, dont le pyproject.toml est déjà
+#     bumpé — l'image embarque donc la bonne version.
+#   - workflow_dispatch : secours pour (re)déployer un tag existant sans créer
+#     de release (retour arrière compris).
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Tag de la version à (re)déployer (ex : v1.5.0)"
+        required: true
+        type: string
+
+# Un seul déploiement à la fois, les suivants attendent leur tour. Pas
+# d'annulation : chaque release publiée doit finir déployée, dans l'ordre.
+concurrency:
+  group: deploy-cloud-run
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write # jeton OIDC GitHub, échangé via Workload Identity Federation
+
+env:
+  # Toutes les valeurs viennent des variables de dépôt (Settings → Secrets and
+  # variables → Actions → Variables) : rien n'est secret — cf. README.
+  GCP_REGION: ${{ vars.GCP_REGION }}
+  GCP_DEPLOY_SA: ${{ vars.GCP_DEPLOY_SA }}
+  CLOUD_RUN_SERVICE: ${{ vars.CLOUD_RUN_SERVICE }}
+  # Chemin complet de l'image dans Artifact Registry (sans tag).
+  IMAGE: ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.ARTIFACT_REGISTRY_REPO }}/${{ vars.CLOUD_RUN_SERVICE }}
+  # Tag git à déployer, selon le déclencheur.
+  RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.version }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Toujours le tag vX.Y.Z, jamais la tête de main : au moment du merge,
+      # le commit de bump de version n'existe pas encore.
+      - name: Checkout du tag de version
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      # Deux tags d'image, un seul digest : la version pour la lisibilité
+      # (corrélation image ↔ release ↔ changelog), le SHA du commit pour la
+      # traçabilité exacte. Pas de latest : mutable, ambigu, inutile.
+      - name: Calcul des tags d'image
+        id: meta
+        run: |
+          echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "sha=sha-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      # Échange du jeton OIDC GitHub contre des credentials GCP éphémères au
+      # nom du compte de service de déploiement. Aucune clé stockée.
+      - name: Authentification GCP (Workload Identity Federation)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SA }}
+
+      - name: Installation du SDK gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Connexion Docker à Artifact Registry
+        run: gcloud auth configure-docker "${GCP_REGION}-docker.pkg.dev" --quiet
+
+      # L'image de PRODUCTION (Dockerfile.prod) : poids EasyOCR cuits dedans,
+      # pas de --reload — l'image de dev (Dockerfile) ne part jamais sur GCP.
+      - name: Build de l'image de production
+        run: |
+          docker build \
+            --file Dockerfile.prod \
+            --tag "${IMAGE}:${{ steps.meta.outputs.version }}" \
+            --tag "${IMAGE}:${{ steps.meta.outputs.sha }}" \
+            .
+
+      - name: Push vers Artifact Registry
+        run: docker push --all-tags "${IMAGE}"
+
+      # La révision référence l'image par digest : immuable, aucune ambiguïté
+      # sur ce qui tourne.
+      - name: Récupération du digest de l'image
+        id: digest
+        run: |
+          DIGEST="$(gcloud artifacts docker images describe \
+            "${IMAGE}:${{ steps.meta.outputs.version }}" \
+            --format 'value(image_summary.digest)')"
+          echo "ref=${IMAGE}@${DIGEST}" >> "$GITHUB_OUTPUT"
+
+      # Pas de migration ici (aucun schéma applicatif, MLflow gère le sien) :
+      # on déploie directement. Seule --image est passée : gcloud run deploy
+      # préserve toute la configuration existante (secrets, variables, compte
+      # de service, probes, scaling), qui appartient à Terraform. La commande
+      # attend que la révision soit prête (startup probe passée) avant de
+      # rendre la main.
+      - name: Déploiement de la nouvelle révision
+        run: |
+          gcloud run deploy "${CLOUD_RUN_SERVICE}" \
+            --image "${{ steps.digest.outputs.ref }}" \
+            --region "${GCP_REGION}" --quiet
+
+      - name: Récupération de l'URL du service
+        id: service-url
+        run: |
+          URL="$(gcloud run services describe "${CLOUD_RUN_SERVICE}" \
+            --region "${GCP_REGION}" --format 'value(status.url)')"
+          echo "url=${URL}" >> "$GITHUB_OUTPUT"
+
+      # L'ingress du service exige une authentification IAM : la sonde porte un
+      # jeton d'identité du compte de déploiement (d'où roles/run.invoker).
+      - name: Jeton d'identité pour la sonde
+        id: idtoken
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SA }}
+          token_format: id_token
+          id_token_audience: ${{ steps.service-url.outputs.url }}
+          id_token_include_email: true
+
+      # Vérification de bout en bout (routage compris), au-delà de la startup
+      # probe interne déjà attendue par gcloud run deploy.
+      - name: Vérification de la sonde /health
+        env:
+          URL: ${{ steps.service-url.outputs.url }}
+          ID_TOKEN: ${{ steps.idtoken.outputs.id_token }}
+        run: |
+          for attempt in 1 2 3 4 5 6; do
+            if curl --fail --silent --show-error --max-time 10 \
+              --header "Authorization: Bearer ${ID_TOKEN}" \
+              "${URL}/health"; then
+              echo "OK : la nouvelle révision répond sur /health"
+              exit 0
+            fi
+            echo "Tentative ${attempt}/6 sans succès, nouvel essai dans 10 s"
+            sleep 10
+          done
+          echo "ÉCHEC : /health ne répond pas — la révision est peut-être en place mais injoignable, vérifier la console Cloud Run"
+          exit 1

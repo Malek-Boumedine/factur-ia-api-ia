@@ -1,0 +1,90 @@
+# ==============================================================================
+# Image de PRODUCTION de l'API IA Factur-IA, destinée à Cloud Run.
+# (L'image de développement locale reste dans ./Dockerfile — deux fichiers,
+# deux usages : ici pas de volume monté, pas de --reload.)
+#
+# Principes :
+# - le code est figé dans l'image, servi par uvicorn sans rechargement ;
+# - écoute sur $PORT, imposé par Cloud Run (8080 par défaut) ;
+# - les poids EasyOCR (~98 Mo) sont cuits dans l'image : le disque Cloud Run
+#   est éphémère et le scale-to-zero fréquent — téléchargés à l'exécution, ils
+#   se rechargeraient à chaque instance froide, en plein pipeline pendant qu'un
+#   document attend. Conséquence : la sonde GET /ready, qui vérifie leur
+#   présence sur disque, est verte dès le démarrage et le reste — elle devient
+#   un contrôle d'intégrité d'image (rouge uniquement si une image a été
+#   construite sans les poids) ;
+# - AUCUN secret dans l'image : SECRET_OCR_TOKEN, GROQ_API_KEY, etc. sont
+#   fournis à l'exécution par Cloud Run (Secret Manager / variables).
+#
+# Réglages Cloud Run indispensables (côté Terraform, pas dans l'image) :
+# - « CPU always allocated » (facturation à l'instance) : le pipeline tourne en
+#   BackgroundTasks APRÈS la réponse 202 — en facturation à la requête, le CPU
+#   est étranglé dès la réponse envoyée et l'OCR serait gelé en plein
+#   traitement ;
+# - concurrency basse (1-2) : chaque OCR est gourmand en mémoire (Reader
+#   EasyOCR ~1 Go résident + jusqu'à ~500 Mo d'images pour un scan de
+#   20 pages, sur les 4 Go prévus) ;
+# - dimensionnement prévu 2 vCPU / 4 Go : un seul worker uvicorn (voir CMD),
+#   la montée en charge se fait horizontalement, par instances.
+#
+# Monitoring MLflow : en production, MLFLOW_TRACKING_URI pointe vers la base
+# `mlflow` dédiée de l'instance Cloud SQL MySQL (URI `mysql+pymysql://…`,
+# pilote pymysql embarqué) — les runs survivent ainsi au recyclage des
+# instances, là où un fichier SQLite local serait perdu. MLflow crée ses tables
+# tout seul au premier usage ; exige le flag Cloud SQL
+# log_bin_trust_function_creators=on (les migrations créent un trigger).
+# Cf. README, section monitoring.
+# ==============================================================================
+
+# Même base que l'image de dev : Python officiel, variante légère.
+FROM python:3.13-slim
+
+# uv copié depuis son image officielle, version épinglée (pas de `curl | sh`).
+# Il ne sert qu'au build : à l'exécution, le PATH pointe sur le venv.
+COPY --from=ghcr.io/astral-sh/uv:0.8 /uv /uvx /bin/
+
+# PYTHONUNBUFFERED : logs visibles immédiatement dans Cloud Logging.
+# UV_COMPILE_BYTECODE : bytecode précompilé au build — imports (torch surtout)
+# plus rapides sur instance froide. Venv dans /opt/venv, placé en tête du
+# PATH : `python` et `uvicorn` désignent ceux du venv, sans préfixe `uv run`.
+ENV PYTHONUNBUFFERED=1 \
+    UV_PROJECT_ENVIRONMENT=/opt/venv \
+    UV_COMPILE_BYTECODE=1 \
+    PATH=/opt/venv/bin:$PATH
+
+WORKDIR /app
+
+# Dépendances d'abord (couche cachée tant que le lock ne change pas), sans le
+# groupe dev ni cache uv : ni pytest, ni mypy, ni ruff dans l'image.
+# torch est résolu depuis l'index CPU (cf. pyproject.toml) : sans cela, les
+# roues CUDA ajouteraient ~4 Go pour un GPU jamais utilisé.
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev --no-install-project --no-cache
+
+# Poids EasyOCR cuits dans l'image, au même chemin /models qu'en dev (où ils
+# viennent d'un volume) : la résolution côté code (EASYOCR_MODULE_PATH) couvre
+# les deux cas sans modification. Couche placée AVANT le code : un changement
+# de code seul ne retélécharge rien. Les langues sont figées au build (alignées
+# sur le défaut OCR_LANGUAGES) : en changer à l'exécution exigerait un rebuild —
+# l'utilisateur non-root ne peut pas écrire dans /models, donc aucun
+# téléchargement possible à l'exécution (c'est voulu).
+ENV EASYOCR_MODULE_PATH=/models
+RUN python -c "import easyocr; easyocr.Reader(['fr', 'en'], gpu=False)"
+
+# Code de l'application (filtré par .dockerignore : ni .env, ni tests, ni
+# données locales).
+COPY . .
+
+# Exécution sans privilèges : le service n'écrit que des fichiers temporaires
+# (dans /tmp) ; les poids cuits par root restent lisibles en lecture seule.
+RUN useradd --create-home appuser
+USER appuser
+
+# Port par défaut de Cloud Run — documentaire : c'est $PORT qui fait foi.
+EXPOSE 8080
+
+# Forme shell requise pour interpoler $PORT ; `exec` fait d'uvicorn le PID 1,
+# qui reçoit donc directement le SIGTERM d'arrêt de Cloud Run. Un seul worker :
+# l'OCR est gourmand en mémoire (voir en-tête), et torch exploite à lui seul
+# les 2 vCPU en parallélisme intra-opération.
+CMD exec uvicorn src.main:app --host 0.0.0.0 --port ${PORT:-8080}
