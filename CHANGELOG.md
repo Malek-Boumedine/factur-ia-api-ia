@@ -2,6 +2,31 @@
 
 <!-- version list -->
 
+## v1.6.0 (2026-08-31)
+
+### Bug Fixes
+
+- **callback**: Authentification IAM du retour vers l'API data
+  ([`dfbf7be`](https://github.com/Malek-Boumedine/factur-ia-api-ia/commit/dfbf7bec361b3815b40c085de36503ce1a59d032))
+
+- **recherche**: Versionne le corpus de la recherche sémantique
+  ([`85478f5`](https://github.com/Malek-Boumedine/factur-ia-api-ia/commit/85478f51a168ed84bf08a7a1ee8e4d616e24ae5b))
+
+### Features
+
+- **ci**: Chaîne de livraison continue vers Cloud Run
+  ([`d5dd25c`](https://github.com/Malek-Boumedine/factur-ia-api-ia/commit/d5dd25c038e5ac760e5d6e7fda042e8b9803b4ab))
+
+- **docker**: Image de production Cloud Run avec poids EasyOCR embarqués
+  ([`4ebfe9d`](https://github.com/Malek-Boumedine/factur-ia-api-ia/commit/4ebfe9d435c773e4d3acd87304ccde0eee83b4db))
+
+- **monitoring**: Métriques Prometheus de qualité d'extraction sur /metrics
+  ([`1aa9c4e`](https://github.com/Malek-Boumedine/factur-ia-api-ia/commit/1aa9c4ef134135421936a52cc3346248a41fcf96))
+
+- **recherche**: Preuve de concept de recherche sémantique sur le corpus réglementaire
+  ([`1f52589`](https://github.com/Malek-Boumedine/factur-ia-api-ia/commit/1f5258966ba8815c18d89cca22ce7f12e8c40af0))
+
+
 ## v1.5.0 (2026-08-08)
 
 ### Bug Fixes
