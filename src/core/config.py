@@ -41,6 +41,12 @@ class Settings(BaseSettings):
     DATA_API_BASE_URL: Requis
     HTTP_TIMEOUT_SECONDS: float = 30.0
     HTTP_MAX_RETRIES: int = 3
+    # Authentification IAM Cloud Run du callback (jeton d'identité Google dans
+    # X-Serverless-Authorization, cf. core/gcp_identity.py). Symétrique de
+    # IA_API_IAM_AUTH_ENABLED côté API data : chaque service nomme le service
+    # appelé. Défaut faux : en dev/test, l'API data locale n'exige aucun jeton
+    # et il n'y a pas de serveur de métadonnées.
+    DATA_API_IAM_AUTH_ENABLED: bool = False
 
     # --- LLM Groq ---
     GROQ_API_KEY: Requis

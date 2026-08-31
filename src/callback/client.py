@@ -3,7 +3,12 @@
 Dernière étape du pipeline : POSTe le ``OcrWebhookPayload`` (succès comme échec)
 vers le webhook OCR de l'API data (``settings.ocr_callback_url``), authentifié
 par le header ``X-OCR-Secret-Token`` (secret partagé — jamais journalisé, ni en
-clair ni dans les messages d'erreur).
+clair ni dans les messages d'erreur). Quand l'API data est derrière IAM Cloud
+Run (``DATA_API_IAM_AUTH_ENABLED``), un jeton d'identité Google part en plus
+dans ``X-Serverless-Authorization`` (cf. ``core/gcp_identity.py``) — obtenu à
+chaque tentative (le cache du module rend l'opération gratuite), et son échec
+d'obtention est traité comme transitoire : serveur de métadonnées
+momentanément injoignable, même famille qu'une erreur réseau.
 
 Sérialisation via ``model_dump_json()`` (Pydantic v2) : les ``Decimal`` partent
 en chaînes JSON — précision des montants préservée, reparsés en ``Decimal`` par
@@ -11,11 +16,11 @@ le schéma miroir côté API data — et les ``date`` en ISO 8601.
 
 Stratégie de retry volontairement simple (pas de lib dédiée) :
 ``HTTP_MAX_RETRIES`` tentatives au total, en ne retentant que le transitoire
-(timeout, erreur réseau, 5xx). Les réponses définitives (403 token refusé,
-404 ``id_document`` inconnu, tout autre statut inattendu) échouent
-immédiatement : rejouer donnerait le même résultat. Pas de backoff entre les
-tentatives — dette MVP assumée, comme la perte du payload en cas d'échec
-définitif (limite du choix ``BackgroundTasks``, cf. CLAUDE.md).
+(timeout, erreur réseau, 5xx, jeton d'identité inobtenable). Les réponses
+définitives (403 accès refusé, 404 ``id_document`` inconnu, tout autre statut
+inattendu) échouent immédiatement : rejouer donnerait le même résultat. Pas de
+backoff entre les tentatives — dette MVP assumée, comme la perte du payload en
+cas d'échec définitif (limite du choix ``BackgroundTasks``, cf. CLAUDE.md).
 """
 
 import logging
@@ -24,22 +29,39 @@ import httpx
 
 from src.callback.schemas import OcrWebhookPayload
 from src.core.config import settings
+from src.core.gcp_identity import IdentityTokenError, serverless_authorization_header
 
 logger = logging.getLogger(__name__)
 
-# Réponses définitives connues du contrat, pour des logs explicites.
+# Réponses définitives connues du contrat, pour des logs explicites. Le 403
+# n'affirme pas sa cause : le client ne peut pas distinguer un refus de la
+# plateforme (IAM Cloud Run, avant même d'atteindre l'application) d'un refus
+# applicatif (secret partagé invalide) — les deux arrivent ici à l'identique.
 _DEFINITIVE_STATUS_DETAILS = {
-    403: "token OCR partagé refusé par l'API data",
+    403: (
+        "accès refusé — par la plateforme (IAM Cloud Run : jeton d'identité "
+        "absent, invalide ou d'audience incorrecte) ou par l'API data "
+        "(X-OCR-Secret-Token invalide)"
+    ),
     404: "id_document inconnu côté API data",
 }
+
+# Indice ajouté au diagnostic du 403 quand l'authentification IAM est
+# désactivée ici : si l'API data est derrière IAM Cloud Run, c'est la cause la
+# plus probable — et la piste du secret partagé serait une fausse piste.
+_HINT_403_IAM_DISABLED = (
+    " ; l'authentification IAM est désactivée sur ce service — si l'API data "
+    "est derrière IAM Cloud Run, activer DATA_API_IAM_AUTH_ENABLED"
+)
 
 
 class CallbackError(Exception):
     """Envoi du payload au webhook OCR de l'API data définitivement échoué.
 
-    Levée dès une réponse définitive (403 token refusé, 404 ``id_document``
+    Levée dès une réponse définitive (403 accès refusé, 404 ``id_document``
     inconnu, statut inattendu) ou après épuisement des tentatives sur du
-    transitoire (timeout, réseau, 5xx). L'orchestrateur du pipeline l'attrape
+    transitoire (timeout, réseau, 5xx, jeton d'identité inobtenable).
+    L'orchestrateur du pipeline l'attrape
     et se contente de journaliser : la tâche de fond ne doit jamais planter,
     et il n'existe pas (encore) de file de rejeu.
     """
@@ -95,10 +117,11 @@ def send_callback(payload: OcrWebhookPayload) -> None:
 
     Raises:
         CallbackError: envoi définitivement échoué — réponse définitive (403,
-            404, statut inattendu) ou transitoire (timeout, réseau, 5xx)
-            persistant après ``HTTP_MAX_RETRIES`` tentatives.
+            404, statut inattendu) ou transitoire (timeout, réseau, 5xx,
+            jeton d'identité inobtenable) persistant après
+            ``HTTP_MAX_RETRIES`` tentatives.
     """
-    headers = {
+    base_headers = {
         "X-OCR-Secret-Token": settings.SECRET_OCR_TOKEN,
         "Content-Type": "application/json",
     }
@@ -107,6 +130,23 @@ def send_callback(payload: OcrWebhookPayload) -> None:
 
     with _build_client() as client:
         for attempt in range(1, settings.HTTP_MAX_RETRIES + 1):
+            try:
+                # En-tête IAM Cloud Run, vide si désactivé. Obtenu à chaque
+                # tentative : le cache de gcp_identity absorbe le coût, et un
+                # serveur de métadonnées momentanément injoignable profite
+                # ainsi des retries comme une erreur réseau.
+                headers = {**base_headers, **serverless_authorization_header()}
+            except IdentityTokenError:
+                last_failure = "jeton d'identité Google impossible à obtenir"
+                logger.warning(
+                    "Document %s — callback OCR, tentative %d/%d échouée : %s.",
+                    payload.id_document,
+                    attempt,
+                    settings.HTTP_MAX_RETRIES,
+                    last_failure,
+                )
+                continue
+
             try:
                 response = client.post(
                     settings.ocr_callback_url,
@@ -145,6 +185,8 @@ def send_callback(payload: OcrWebhookPayload) -> None:
             detail = _DEFINITIVE_STATUS_DETAILS.get(
                 response.status_code, "réponse inattendue de l'API data"
             )
+            if response.status_code == 403 and not settings.DATA_API_IAM_AUTH_ENABLED:
+                detail += _HINT_403_IAM_DISABLED
             logger.error(
                 "Document %s — callback OCR refusé (HTTP %d : %s), abandon.",
                 payload.id_document,

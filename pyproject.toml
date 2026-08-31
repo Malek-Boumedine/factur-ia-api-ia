@@ -11,6 +11,11 @@ dependencies = [
     "pydantic>=2.10",
     "pydantic-settings>=2.7",
     "httpx>=0.28",
+    # Jeton d'identité Google du callback vers l'API data derrière IAM Cloud Run
+    # (core/gcp_identity.py). Même borne que l'API data ET que le hook mypy de
+    # .pre-commit-config.yaml : les garder alignées, sinon le hook voit une
+    # autre version et juge différemment les `type: ignore` ciblés.
+    "google-auth>=2.57.0",
     "loguru>=0.7",
     "pdfplumber>=0.11",
     "easyocr>=1.7",
