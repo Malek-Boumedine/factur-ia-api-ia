@@ -171,9 +171,3 @@ uv run mlflow ui --backend-store-uri sqlite:///mlflow.db
 ```
 
 Trois lectures utiles : le **tableau des extractions**, filtrable par étiquette ; le **graphe temporel** d'une métrique, qui montre la dérive ; et la **comparaison** entre modèles sur la même population de documents. Les dix séries par champ répondent à « quel champ est chroniquement faible ? », donc à « que faut-il corriger dans l'instruction ? ».
-
-### Une limite assumée
-
-**Le suivi de modèle ne sait pas alerter.** C'est sa limite face à un couple métriques-alertes, et elle est assumée : le reste de ce qu'il apporte — la notion d'exécution, la comparaison de modèles, le détail par extraction — n'a pas d'équivalent simple ailleurs, et la stack d'observabilité couvre déjà l'alerte agrégée.
-
-À défaut, un score sous le seuil déclenche un avertissement dans les journaux et une étiquette qui rend les extractions dégradées filtrables en un clic.
