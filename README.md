@@ -1,281 +1,179 @@
 # factur-ia-api-ia
 
-Microservice IA d'extraction de factures du système **Factur-IA**. Il reçoit un PDF ou une image de l'API data, en extrait le texte (pdfplumber pour un PDF natif, EasyOCR pour un scan ou une image), le structure via un LLM (Groq), puis renvoie le résultat à l'API data par un callback signé.
+Service d'extraction de factures du système **Factur-IA**. Il reçoit un PDF ou une image de l'API data, en extrait le texte (lecture directe pour un PDF natif, reconnaissance optique pour un scan), le structure par un modèle de langage, puis renvoie le résultat par un appel de retour authentifié.
 
 ## Démarrage
 
 ```bash
-uv sync --all-groups                          # dépendances
+git clone https://github.com/Malek-Boumedine/factur-ia-api-ia && cd factur-ia-api-ia
+
+uv sync --all-groups
 uv run uvicorn src.main:app --reload --port 8001
 ```
 
-Copier `.env.example` en `.env` et renseigner au minimum `SECRET_OCR_TOKEN` (partagé avec l'API data) et `GROQ_API_KEY` : sans elles, l'application ne démarre pas.
+Copier `.env.example` en `.env` et renseigner au minimum `SECRET_OCR_TOKEN` (partagé avec l'API data — **la même valeur des deux côtés**) et `GROQ_API_KEY` — sans elles, l'application ne démarre pas.
 
 ```bash
-uv run pytest --cov=src                       # tests
-uv run mypy src/                              # typage strict
-uv run pre-commit run --all-files             # lint + format
+openssl rand -hex 32    # génère le jeton partagé
 ```
 
-### Avec Docker (local)
+### Vérifications
 
 ```bash
-docker compose up --build                     # API sur http://localhost:8001
+uv run pytest --cov=src            # tests
+uv run mypy src/                   # typage strict
+uv run pre-commit run --all-files  # lint et formatage
 ```
 
-Le code est monté depuis l'hôte : uvicorn recharge à chaud. Le `.env` est lu tel quel, à une exception près — le compose force `DATA_API_BASE_URL` sur `http://host.docker.internal:8080`, puisque l'API data tourne sur l'hôte et non dans ce compose. **Elle doit écouter sur `0.0.0.0`** : sur `127.0.0.1`, elle reste injoignable depuis le conteneur.
+### Avec Docker
 
-Les **poids EasyOCR** (~98 Mo) ne sont pas cuits dans l'image : ils sont téléchargés au premier document scanné dans le volume `ocr_models`, qui survit aux redémarrages comme aux reconstructions. Le premier scan est donc lent, et `GET /ready` répond 503 tant que le volume est vide — c'est exactement ce que la sonde est censée signaler. Pour l'amorcer et passer au vert tout de suite :
+```bash
+docker compose up --build          # API sur http://localhost:8001
+```
+
+Le code est monté depuis l'hôte, uvicorn recharge à chaud. Le compose force l'URL de l'API data vers l'hôte — **elle doit écouter sur `0.0.0.0`**, sinon elle reste injoignable depuis le conteneur.
+
+Les **poids de reconnaissance optique** (~98 Mo) ne sont pas dans l'image de développement : ils sont téléchargés au premier document scanné dans un volume qui survit aux redémarrages. Le premier scan est donc lent, et `GET /ready` répond 503 tant que le volume est vide. Pour l'amorcer :
 
 ```bash
 docker compose run --rm api uv run --no-sync \
   python -c "import easyocr; easyocr.Reader(['fr','en'], gpu=False)"
 ```
 
-Rien d'autre dans ce compose : pas de base de données (le service n'en a pas), pas de broker ni de worker (l'asynchrone tient dans le processus), pas de reverse proxy. Le monitoring MLflow écrit son `mlflow.db` dans le projet monté, sans volume dédié.
+Rien d'autre dans ce compose : pas de base de données, pas de broker, pas de reverse proxy — le service n'en a pas besoin.
 
-> **Image ~1,5 Go.** `torch` est résolu depuis l'index CPU de PyTorch (`tool.uv.sources` dans `pyproject.toml`) : les roues PyPI embarquent CUDA sur Linux, soit ~4 Go de paquets `nvidia-*` pour un GPU que l'OCR n'utilise jamais (`EASYOCR_GPU=False`). Cette redirection profite aussi au venv local et à la CI.
+> **Image ~1,5 Go.** PyTorch est résolu depuis l'index processeur : les roues standard embarquent CUDA sur Linux, soit environ 4 Go de paquets pour un matériel graphique que la reconnaissance n'utilise jamais.
 
-### Image de production (`Dockerfile.prod`)
+### Image de production
 
 ```bash
 docker build -f Dockerfile.prod -t factur-ia-api-ia:prod .
-docker run -e PORT=8080 -p 8080:8080 factur-ia-api-ia:prod   # + secrets via -e/--env-file
 ```
 
-Destinée à Cloud Run : code figé dans l'image, uvicorn sans rechargement (un seul worker) écoutant sur `$PORT`, utilisateur non-root, aucun secret dans l'image. Les **poids EasyOCR sont cuits dans l'image** (~1,8 Go au total, bytecode précompilé compris) : rien n'est téléchargé à l'exécution, `GET /ready` est vert dès le démarrage (~0,7 s en local) et devient un contrôle d'intégrité d'image. Les langues OCR sont figées au build (`fr,en`, alignées sur le défaut `OCR_LANGUAGES`) : en changer exige un rebuild. Le monitoring MLflow pointe en production vers la base `mlflow` dédiée de l'instance Cloud SQL MySQL (`MLFLOW_TRACKING_URI`, cf. [section monitoring](#monitoring-de-la-qualité-dextraction)) : les runs survivent au recyclage des instances.
+Destinée à Cloud Run : code figé, uvicorn sans rechargement, utilisateur non-root, aucun secret embarqué. Les **poids sont cuits dans l'image** (~1,8 Go au total) : rien n'est téléchargé à l'exécution, et `GET /ready` devient un contrôle d'intégrité d'image. Les langues sont figées au moment de la construction.
 
-## Collecte des FAQ réglementaires (scraping)
+## Collecte des questions-réponses réglementaires
 
-Un batch indépendant du pipeline collecte des questions-réponses publiques sur la facturation électronique (DGFiP, Le Coin des Entrepreneurs) et les agrège dans `data/faq.csv`, en vue d'un futur chatbot RAG :
+Un batch indépendant du pipeline collecte des questions-réponses publiques sur la facturation électronique et les agrège dans `data/faq.csv` :
 
 ```bash
 uv run python -m src.scraping
 ```
 
-Sources et règles de sélection, enchaînement de l'algorithme, nettoyage et homogénéisation, limites : voir **[src/scraping/README.md](src/scraping/README.md)**.
+Sources, règles de sélection et limites : voir **[src/scraping/README.md](src/scraping/README.md)**.
 
 ## Tests
 
-216 tests, 100 % de couverture de `src/`. La suite tourne en une dizaine de secondes, **sans réseau** : le LLM Groq, EasyOCR et le callback de l'API data sont toujours simulés, et une garde installée dans `tests/conftest.py` fait échouer tout test qui tenterait une connexion réelle. Les documents d'exemple sont générés en mémoire (aucun binaire versionné, aucune donnée réelle : les SIRET et IBAN sont inventés).
+**266 tests**, exécutés en une dizaine de secondes, **sans aucun réseau** : le modèle de langage, la reconnaissance optique et l'appel de retour sont toujours simulés, et une garde installée dans `tests/conftest.py` fait échouer tout test qui tenterait une connexion réelle.
 
-La **[stratégie de test](docs/strategie-de-test.md)** détaille, pour chaque étape du pipeline, la partie visée, le périmètre, l'approche retenue et les limites connues — notamment l'absence de vérité terrain, qui interdit toute mesure du taux d'erreur d'extraction.
+Les documents d'exemple sont générés en mémoire — aucun binaire versionné, aucune donnée réelle, les identifiants sont inventés mais structurellement valides.
+
+**Couverture** : 100 % sur le périmètre API (extraction, retour, configuration, point d'entrée), 76 % sur l'ensemble de `src/` — l'écart vient de deux modules hors API : le collecteur de questions-réponses et la preuve de concept de recherche sémantique.
+
+La [stratégie de test](https://github.com/Malek-Boumedine/factur-ia-meta/blob/main/docs/strategie-de-test.md) détaille, pour chaque étape du pipeline, le périmètre visé et les limites connues — notamment l'absence de vérité terrain, qui interdit toute mesure du taux d'erreur réel.
 
 ## Sondes de disponibilité
 
-Deux routes destinées à la plateforme de déploiement : publiques (Cloud Run sonde sans en-tête d'authentification), mais **hors contrat OpenAPI** et sans aucune information exploitable dans les réponses — ni version, ni configuration, ni détail d'erreur.
+Deux routes destinées à la plateforme : publiques (elle sonde sans en-tête d'authentification), mais hors contrat OpenAPI et sans aucune information exploitable — ni version, ni configuration, ni détail d'erreur.
 
 | Route | Rôle | Vérifie | Échec |
-| --- | --- | --- | --- |
-| `GET /health` | Liveness — le processus est-il vivant ? | rien | **redémarrage** du conteneur |
-| `GET /ready` | Readiness — cette instance peut-elle mener une extraction à bien ? | poids EasyOCR présents sur disque | **retrait du trafic**, sans redémarrage |
+|---|---|---|---|
+| `GET /health` | Le processus est-il vivant ? | rien | **Redémarrage** du conteneur |
+| `GET /ready` | L'instance peut-elle travailler ? | Présence des poids sur disque | **Retrait du trafic**, sans redémarrage |
 
-`/health` répond 200 inconditionnellement, sans la moindre I/O : puisque son échec redémarre le conteneur, la faire dépendre d'un tiers ferait redémarrer en boucle des instances parfaitement saines.
+`/health` répond 200 inconditionnellement, sans aucune entrée-sortie : son échec redémarrant le conteneur, la faire dépendre d'un tiers ferait redémarrer en boucle des instances parfaitement saines.
 
-### Ce que `/ready` vérifie, et pourquoi si peu
+**La règle appliquée à `/ready`** : ne sortir une instance du trafic que si la panne lui est **locale** et qu'une autre instance ferait mieux. Une panne partagée ne se répare pas en retirant du trafic.
 
-La règle appliquée : **ne sortir une instance du trafic que si la panne lui est locale et qu'une autre instance ferait mieux.** Une panne partagée ne se répare pas en retirant du trafic — elle se gère par retries et par un échec propre.
+Une seule dépendance satisfait ce critère, les poids de reconnaissance : sans eux, leur téléchargement se déclencherait au milieu du pipeline, et une indisponibilité du dépôt distant se traduirait en extraction ratée pour un document pourtant lisible. Le contrôle est une simple présence de fichier — pas de réseau, environ une milliseconde.
 
-Une seule dépendance satisfait ce critère : les **poids EasyOCR**. Sans eux, le premier document scanné déclencherait leur téléchargement (~98 Mo) *au milieu* du pipeline ; sur un système de fichiers éphémère, cette attente non bornée se rejoue à chaque instance froide, et une indisponibilité du CDN se traduirait en extraction ratée (`score_confiance = 0`) pour un document pourtant lisible. Le contrôle est une simple présence de fichier : pas de réseau, pas de chargement de torch, ~1 ms.
+Ne sont volontairement **pas** vérifiés : le fournisseur du modèle (jamais d'appel payant depuis une sonde interrogée en continu, et se retirer du trafic nous priverait d'émettre les échecs proprement) et l'API data (panne partagée : si elle est indisponible, elle ne nous envoie plus rien).
 
-Ne sont volontairement **pas** vérifiés :
+### Configuration de la plateforme
 
-- **Groq** — jamais d'appel à un service payant depuis une sonde interrogée en continu. Surtout, se retirer du trafic parce que Groq est tombé nous priverait d'émettre les payloads d'échec : les documents resteraient bloqués « en attente » côté API data au lieu de passer proprement en « erreur ». La présence de la clé n'est pas testée non plus — `GROQ_API_KEY` est requise par la configuration, donc l'application ne démarre pas sans elle.
-- **l'API data** (destination du callback) — panne partagée, non locale. Le callback a ses propres retries, il intervient en fin de pipeline et non à l'entrée, et si l'API data est indisponible elle ne nous envoie plus rien : il n'y a aucun trafic à retirer.
+**Le processeur doit rester alloué en continu** : le pipeline tourne en tâche de fond **après** la réponse 202 — en facturation à la requête, il serait étranglé dès la réponse envoyée et l'extraction gelée en plein traitement.
 
-Limite assumée : une instance sans poids est retirée du trafic alors qu'elle traiterait encore les PDF natifs (le cas majoritaire). En production (`Dockerfile.prod`), les poids sont cuits dans l'image — le contrôle devient alors un contrôle d'intégrité d'image, toujours vert, rouge immédiatement si l'image est cassée.
+**Concurrence basse**, un seul worker : chaque extraction est gourmande en mémoire (environ 1 Go résident, plus jusqu'à 500 Mo d'images pour un scan long, sur 2 processeurs virtuels et 4 Go). La montée en charge se fait horizontalement.
 
-### Configuration Cloud Run
+**Sonde de démarrage** sur `/health`, avec plusieurs tentatives espacées — environ une minute de marge pour un démarrage à froid.
 
-- **« CPU always allocated » est indispensable** (facturation à l'instance) : le pipeline tourne en `BackgroundTasks` **après** la réponse 202 — en facturation à la requête, le CPU est étranglé dès la réponse envoyée et l'OCR serait gelé en plein traitement.
-- **Concurrency basse (1-2)**, un seul worker uvicorn : chaque OCR est gourmand en mémoire (Reader EasyOCR ~1 Go résident + jusqu'à ~500 Mo d'images pour un scan de 20 pages, sur les 2 vCPU / 4 Go prévus) ; la montée en charge se fait horizontalement, par instances.
-- **Startup probe** sur `/health` : `periodSeconds: 10`, `failureThreshold: 6`, `timeoutSeconds: 4` — laisse ~60 s de démarrage à froid.
-- **Liveness probe** sur `/health` : `periodSeconds: 30`, `timeoutSeconds: 4`, `failureThreshold: 3`.
-- Cloud Run ne propose pas de readiness probe continue au sens Kubernetes : `/ready` sert d'*uptime check* (une alerte « instance hors trafic ») et de readiness le jour où le service tournerait sur GKE.
-- Le répertoire des poids EasyOCR se pilote par `EASYOCR_MODULE_PATH` (défaut `~/.EasyOCR/`), utile pour pointer un volume ou l'emplacement choisi dans l'image.
+## Livraison continue
 
-> Si une instrumentation HTTP (OpenTelemetry, Prometheus) est ajoutée plus tard, **exclure ces deux routes** : sondées en continu, elles écraseraient les statistiques de latence et de taux d'erreur du trafic réel.
+À la publication d'une version, le workflow récupère le tag correspondant, construit l'image de production (jamais celle de développement) avec deux étiquettes — version et empreinte du commit, pas de `latest` —, la pousse, déploie la révision par empreinte, puis interroge la sonde de santé avec un jeton d'identité. Un déclenchement manuel permet de redéployer n'importe quelle version, retour arrière compris.
 
-## Livraison continue (`.github/workflows/deploy.yml`)
+**Partage des responsabilités** : l'infrastructure possède la *forme* du service — configuration, secrets, dimensionnement — et ignore le champ image ; la livraison possède son *contenu*.
 
-Workflow transposé de celui de `factur-ia-api-data` (conçu pour l'être — voir sa section « Livraison continue ») : mêmes décisions, seules les spécificités de ce dépôt changent.
+**Pas d'étape de migration** : ce service n'a aucun schéma applicatif. Le suivi de modèle crée ses tables tout seul au premier usage.
 
-**Partage des responsabilités** : Terraform (dépôt `factur-ia-infra`) possède la *forme* du service Cloud Run — configuration, secrets, compte de service runtime, IAM — et pose un `ignore_changes` sur l'image (déjà en place) ; la chaîne de livraison possède son *contenu* : elle construit l'image de production, la pousse dans Artifact Registry et déploie une nouvelle révision en ne passant que `--image`. Elle ne touche jamais à l'infrastructure.
+**Construction longue, sans cache** : l'image fait environ 1,8 Go et télécharge les poids au moment de la construction, soit dix à quinze minutes à froid. Un cache de couches économiserait cinq à huit minutes, mais s'évincerait entre deux versions — complexité écartée.
 
-**Déroulé** : à la publication d'une release GitHub (créée par le workflow Semantic Release au merge sur `main`), le workflow checkout le tag `vX.Y.Z` (le `pyproject.toml` y est déjà bumpé — l'image annonce la bonne version), construit l'image **depuis `Dockerfile.prod`** (celle qui embarque les poids EasyOCR — jamais l'image de dev) avec deux tags (`X.Y.Z` + `sha-<commit>`, pas de `latest`), la pousse, déploie la révision **par digest**, puis interroge `/health` avec un jeton d'identité (l'ingress est sous IAM) — échec du workflow si la sonde ne répond pas. Un `workflow_dispatch` permet de (re)déployer n'importe quel tag existant sans créer de release (retour arrière compris).
+### Variables GitHub
 
-**Ce qui diffère de l'API data** :
+Aucun secret : la fédération d'identité rend tout stockage confidentiel inutile. Tout va dans les **variables de dépôt**.
 
-- **Pas d'étape de migration** : ce service n'a aucun schéma applicatif. MLflow crée ses tables tout seul au premier usage (cf. [section monitoring](#en-production--base-cloud-sql-mysql)) — la seule condition, le flag Cloud SQL `log_bin_trust_function_creators=on`, est déjà posée par le Terraform. Rien à exécuter avant la bascule.
-- **Build plus long, sans cache** : l'image de production fait ~1,8 Go et télécharge les poids EasyOCR au build (~10-15 min à froid, très loin des limites GitHub Actions). Un cache de couches (buildx + cache GitHub Actions) économiserait 5 à 8 min, mais s'évince après 7 jours d'inutilisation : à la cadence des releases il serait froid la plupart du temps — complexité écartée, à reconsidérer si la durée devient gênante.
+| Variable | Contenu |
+|---|---|
+| `GCP_WORKLOAD_IDENTITY_PROVIDER` | Fournisseur d'identité, sortie Terraform |
+| `GCP_DEPLOY_SA` | `github-deployer-api-ia@<projet>.iam.gserviceaccount.com` |
+| `GCP_PROJECT_ID` | Identifiant du projet |
+| `GCP_REGION` | `europe-west9` |
+| `ARTIFACT_REGISTRY_REPO` | `factur-ia` |
+| `CLOUD_RUN_SERVICE` | `factur-ia-api-ia` |
 
-### Variables GitHub à configurer
+Les ressources correspondantes — compte de déploiement, rôles, liaison d'identité — sont décrites dans le dépôt [`factur-ia-infra`](https://github.com/Malek-Boumedine/factur-ia-infra).
 
-Aucun secret : avec la fédération d'identité, rien de confidentiel n'est stocké. Tout va dans les **variables de dépôt** (Settings → Secrets and variables → Actions → Variables) :
-
-| Variable | Contenu | Exemple |
-|---|---|---|
-| `GCP_WORKLOAD_IDENTITY_PROVIDER` | Nom complet du provider WIF (sortie Terraform `wif_provider_name`) | `projects/1234567890/locations/global/workloadIdentityPools/github-actions/providers/github-oidc` |
-| `GCP_DEPLOY_SA` | Email du compte de service de déploiement de **ce** dépôt | `github-deployer-api-ia@<projet>.iam.gserviceaccount.com` |
-| `GCP_PROJECT_ID` | ID du projet GCP | `factur-ia-prod` |
-| `GCP_REGION` | Région Cloud Run / Artifact Registry | `europe-west9` |
-| `ARTIFACT_REGISTRY_REPO` | Nom du dépôt Artifact Registry | `factur-ia` |
-| `CLOUD_RUN_SERVICE` | Nom du service Cloud Run (aussi utilisé comme nom d'image) | `factur-ia-api-ia` |
-
-### Prérequis côté infrastructure (Terraform, dépôt `factur-ia-infra`)
-
-Le pool et le provider WIF sont **partagés par les trois dépôts** et déjà décrits pour l'API data — ne pas les recréer. Ce dépôt n'apporte que son compte de service de déploiement, sa liaison restreinte à lui seul, et ses rôles sur *son* service (sans liaison de job de migration, il n'y en a pas) :
-
-```hcl
-# ── Compte de service de déploiement de factur-ia-api-ia ─────────────────────
-
-resource "google_service_account" "github_deployer_api_ia" {
-  account_id   = "github-deployer-api-ia"
-  display_name = "CD GitHub Actions — factur-ia-api-ia"
-}
-
-# Seul le dépôt factur-ia-api-ia peut emprunter ce compte de service.
-resource "google_service_account_iam_member" "deployer_api_ia_wif" {
-  service_account_id = google_service_account.github_deployer_api_ia.name
-  role               = "roles/iam.workloadIdentityUser"
-  member             = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.github.name}/attribute.repository/Malek-Boumedine/factur-ia-api-ia"
-}
-
-# ── Rôles du compte de déploiement (moindre privilège) ───────────────────────
-
-# Pousser l'image.
-resource "google_artifact_registry_repository_iam_member" "deployer_api_ia_push" {
-  location   = var.region
-  repository = google_artifact_registry_repository.images.repository_id
-  role       = "roles/artifactregistry.writer"
-  member     = "serviceAccount:${google_service_account.github_deployer_api_ia.email}"
-}
-
-# Déployer une révision — pas run.admin : le workflow ne doit pas pouvoir
-# modifier l'IAM du service.
-resource "google_cloud_run_v2_service_iam_member" "deployer_api_ia_developer" {
-  location = var.region
-  name     = google_cloud_run_v2_service.api_ia.name
-  role     = "roles/run.developer"
-  member   = "serviceAccount:${google_service_account.github_deployer_api_ia.email}"
-}
-
-# Appeler /health après déploiement (l'ingress est sous IAM).
-resource "google_cloud_run_v2_service_iam_member" "deployer_api_ia_invoker" {
-  location = var.region
-  name     = google_cloud_run_v2_service.api_ia.name
-  role     = "roles/run.invoker"
-  member   = "serviceAccount:${google_service_account.github_deployer_api_ia.email}"
-}
-
-# Déployer une révision qui s'exécute sous l'identité du SA runtime du service.
-resource "google_service_account_iam_member" "deployer_api_ia_actas_runtime" {
-  service_account_id = google_service_account.api_ia.name
-  role               = "roles/iam.serviceAccountUser"
-  member             = "serviceAccount:${google_service_account.github_deployer_api_ia.email}"
-}
-```
-
-Divergence cosmétique à harmoniser côté infra : le workflow nomme l'image d'après `CLOUD_RUN_SERVICE` (`factur-ia-api-ia`), alors que des exemples manuels du README infra utilisaient `api-ia` — c'est la convention du workflow qui fait foi.
-
-## Monitoring de la qualité d'extraction
+## Suivi de la qualité d'extraction
 
 ### À quoi ça sert
 
-Chaque extraction produit déjà des signaux de qualité : un score de confiance global, une confiance par champ, un type de document suggéré. Le monitoring les **trace dans le temps** pour répondre à trois questions :
+Chaque extraction produit des signaux de qualité : un score global, une confiance par champ, un type de document. Le suivi les **trace dans le temps** pour répondre à trois questions : la qualité se dégrade-t-elle, quels champs sont chroniquement mal extraits, et un changement de modèle améliore-t-il les résultats ?
 
-- la qualité du modèle se dégrade-t-elle (dérive) ?
-- quels champs sont chroniquement mal extraits (→ retoucher le prompt) ?
-- un changement de modèle Groq améliore-t-il ou dégrade-t-il les résultats ?
-
-C'est du monitoring **de modèle**, distinct du monitoring **applicatif** (latence, erreurs HTTP) assuré par la stack OpenTelemetry de l'API data.
+C'est du suivi **de modèle**, distinct du monitoring **applicatif** — latence, erreurs — assuré par la stack d'observabilité.
 
 ### Activation
 
-Désactivé par défaut. Quatre variables, toutes documentées dans `.env.example` :
+Désactivé par défaut. Quatre variables, documentées dans `.env.example` :
 
 | Variable | Défaut | Rôle |
-| --- | --- | --- |
-| `MLFLOW_ENABLED` | `False` | Interrupteur unique du traçage |
+|---|---|---|
+| `MLFLOW_ENABLED` | `False` | Interrupteur unique |
 | `MLFLOW_TRACKING_URI` | `sqlite:///mlflow.db` | Où sont stockées les métriques |
-| `MLFLOW_EXPERIMENT_NAME` | `factur-ia-extraction` | Nom de l'expérience MLflow |
+| `MLFLOW_EXPERIMENT_NAME` | `factur-ia-extraction` | Nom de l'expérience |
 | `MONITORING_SEUIL_ALERTE` | `0.7` | Score sous lequel une extraction est signalée |
 
-**Aucun serveur n'est nécessaire pour écrire** : le store par défaut est un simple fichier SQLite local. Le serveur MLflow ne sert qu'à *relire*. Tant que `MLFLOW_ENABLED` est faux, rien n'est tracé et la bibliothèque `mlflow` n'est même pas importée — le comportement du service est strictement inchangé, en local comme en CI (les tests tournent monitoring éteint).
+**Aucun serveur n'est nécessaire pour écrire** : le stockage par défaut est un fichier local, le serveur ne sert qu'à relire. Tant que l'interrupteur est fermé, rien n'est tracé et la bibliothèque n'est même pas importée.
 
-### En production : base Cloud SQL MySQL
-
-Le disque des instances Cloud Run est éphémère : un fichier SQLite y serait perdu à chaque recyclage — tracer pour perdre est pire que ne pas tracer. En production, `MLFLOW_TRACKING_URI` pointe donc vers une base `mlflow` dédiée sur l'instance Cloud SQL MySQL déjà provisionnée pour l'application (coût nul) : `mysql+pymysql://<user>:<motdepasse>@hote:3306/mlflow`. Le pilote `pymysql` est en dépendance runtime ; le module de monitoring ne change pas, l'URI est déjà pilotée par variable d'environnement.
-
-MLflow **crée ses tables tout seul au premier usage** (migrations Alembic automatiques, aucun job d'initialisation à prévoir), à une condition : le flag Cloud SQL `log_bin_trust_function_creators=on`. Les migrations créent un trigger, que MySQL refuse à un utilisateur non-SUPER quand le journal binaire est actif (erreur 1419) — et le binlog est toujours actif sur Cloud SQL.
-
-Volumétrie mesurée : **~16 Kio par run** (15 métriques, 10 tags, index compris), soit ~16 Mio pour 1 000 extractions. MLflow n'a pas de purge native : au-delà de la durée de conservation retenue (registre RGPD), prévoir un job périodique qui supprime les runs anciens puis exécute `mlflow gc`.
+**En production**, le stockage pointe vers une base dédiée sur l'instance Cloud SQL déjà provisionnée — le disque des instances étant éphémère, un fichier local serait perdu à chaque recyclage. Volumétrie mesurée : environ 16 Kio par extraction.
 
 ### Ce qui est tracé
 
-Un **run MLflow par extraction**, succès comme échec, enregistré après l'envoi au callback pour ne jamais retarder le traitement.
+Un enregistrement par extraction, succès comme échec, écrit **après** l'envoi du résultat pour ne jamais retarder le traitement.
 
-**Métriques** (numériques, suivies dans le temps) :
+**Métriques** : score de confiance global, taux de champs reconnus, taux de champs présents, confiance de chacun des dix champs principaux, succès ou échec, durée du pipeline.
 
-| Métrique | Ce qu'elle mesure |
-| --- | --- |
-| `score_confiance` | Confiance globale de l'extraction (0 à 1) |
-| `taux_champs_reconnus` | Part des 10 champs extraits avec une confiance ≥ 0.7 |
-| `taux_champs_presents` | Part des 10 champs extraits, quelle que soit leur fiabilité |
-| `confiance_<champ>` (×10) | Confiance de chaque champ pris isolément |
-| `extraction_reussie` | 1 en cas de succès, 0 sur un payload d'échec |
-| `duree_secondes` | Durée du pipeline complet |
+Le seuil de 0,7 n'est pas arbitraire : c'est la valeur attribuée à un champ présent et non démenti par un contrôle d'intégrité. En dessous, le champ est soit absent, soit mal formé, soit invalidé.
 
-Le seuil de 0.7 n'est pas arbitraire : c'est la valeur qu'attribue `confidence.py` à un champ présent et non démenti par un contrôle d'intégrité. En dessous, le champ est soit absent (0), soit mal formé (0.2), soit invalidé par un contrôle (0.4). L'écart entre les deux taux distingue « le champ manque » de « le champ est là mais douteux » — deux problèmes différents.
+**Étiquettes** : identifiant du document, statut, type de document détecté, mode d'extraction, modèle appelé, dépassement du seuil.
 
-**Tags** (dimensions de filtrage et de regroupement) :
-
-| Tag | Valeurs | Intérêt |
-| --- | --- | --- |
-| `id_document` | entier | Retrouver le document derrière un run dégradé |
-| `statut` | `succes`, `echec` | Suivre le taux d'échec |
-| `type_document` | `facture`, `devis`, `avoir`, `inconnu`, `non_calcule` | Répartition des documents reçus |
-| `mode_extraction` | `pdf_natif`, `ocr`, `inconnu` | **Explique** une dérive du score |
-| `modele_llm` | nom du modèle Groq | Comparer deux modèles |
-| `alerte` | `true`, `false` | Isoler les extractions dégradées |
-
-`mode_extraction` mérite une mention : une baisse du score moyen s'explique bien plus souvent par « davantage de documents scannés arrivent » que par une dégradation du modèle. Sans ce tag, on voit la dérive sans pouvoir l'expliquer.
+Le **mode d'extraction** mérite une mention : une baisse du score moyen s'explique bien plus souvent par « davantage de documents scannés arrivent » que par une dégradation du modèle. Sans cette étiquette, on voit la dérive sans pouvoir l'expliquer.
 
 ### Données sensibles
 
-**Seuls des agrégats sont tracés.** Le contenu du run est construit depuis une liste blanche explicite (`src/core/monitoring.py`) : le payload n'est jamais sérialisé, ses champs ne sont jamais parcourus. Ne partent que des nombres entre 0 et 1, une durée, des étiquettes à valeurs bornées et l'`id_document`.
+**Seuls des agrégats sont tracés.** Le contenu est construit depuis une **liste blanche explicite** : le résultat n'est jamais sérialisé, ses champs ne sont jamais parcourus. Ne partent que des nombres, une durée, des étiquettes à valeurs bornées et l'identifiant du document.
 
-Ne sortent **jamais** : le texte brut du document, les SIRET, l'IBAN, le numéro de facture, les montants, les dates, les désignations de lignes, le nom du fichier, ni aucun secret. Un test vérifie cette garantie de bout en bout sur ce que le store a réellement écrit (`tests/test_monitoring.py`).
-
-L'`id_document` est le seul identifiant tracé. Ce n'est pas une donnée personnelle — un entier interne, qui n'apprend rien sans accès à la base de l'API data — mais il est indispensable pour retrouver le document derrière un run à 0.3.
+Ne sortent **jamais** : le texte du document, les identifiants d'entreprise, les coordonnées bancaires, le numéro de facture, les montants, les dates, ni aucun secret. Un test vérifie cette garantie sur ce que le stockage a réellement écrit.
 
 ### Restitution
-
-L'interface MLflow, lancée en local :
 
 ```bash
 uv run mlflow ui --backend-store-uri sqlite:///mlflow.db
 # puis http://localhost:5000
 ```
 
-Pour relire la base de production, passer à `--backend-store-uri` la même URI MySQL que le service.
+Trois lectures utiles : le **tableau des extractions**, filtrable par étiquette ; le **graphe temporel** d'une métrique, qui montre la dérive ; et la **comparaison** entre modèles sur la même population de documents. Les dix séries par champ répondent à « quel champ est chroniquement faible ? », donc à « que faut-il corriger dans l'instruction ? ».
 
-Trois lectures utiles :
+### Une limite assumée
 
-- **tableau des runs** : une ligne par extraction, triable par score, filtrable par tag — `tags.alerte = 'true'`, `tags.statut = 'echec'`, `tags.mode_extraction = 'ocr'` ;
-- **graphe temporel** d'une métrique sur l'ensemble des runs : la courbe de `score_confiance` dans le temps, c'est-à-dire la dérive ;
-- **comparaison de runs** : sélectionner des runs de `modele_llm` différents et comparer leurs métriques sur la même population de documents.
+**Le suivi de modèle ne sait pas alerter.** C'est sa limite face à un couple métriques-alertes, et elle est assumée : le reste de ce qu'il apporte — la notion d'exécution, la comparaison de modèles, le détail par extraction — n'a pas d'équivalent simple ailleurs, et la stack d'observabilité couvre déjà l'alerte agrégée.
 
-Les dix séries `confiance_<champ>` répondent à « quel champ est chroniquement faible ? », c'est-à-dire à « que faut-il corriger dans le prompt ? ».
-
-### Alerte — compromis assumé
-
-**MLflow ne sait pas alerter.** C'est sa limite face à un couple Prometheus/Grafana, et elle est assumée : le reste de ce qu'apporte MLflow (la notion de run, la comparaison de modèles, le suivi par extraction) n'a pas d'équivalent simple côté métriques, et l'API data couvre déjà l'alerting applicatif.
-
-À défaut d'alerting natif, un score sous `MONITORING_SEUIL_ALERTE` déclenche deux choses : un `WARNING` dans les logs applicatifs (récupérable par n'importe quel collecteur de logs) et le tag `alerte=true` sur le run, qui rend les extractions dégradées filtrables en un clic dans l'interface. Une vraie règle d'alerting viendra avec la centralisation des logs.
-
-### Notes d'exploitation
-
-- Le store par défaut est un fichier SQLite dans le répertoire de travail. Le store « répertoire de fichiers » (`file:./mlruns`) existe toujours mais MLflow l'a placé en mode maintenance : SQLite est le backend local recommandé. `MLFLOW_TRACKING_URI` accepte aussi l'URL d'un serveur MLflow.
-- Un run par extraction : prévoir une purge périodique du store en cas de fort volume.
-- Le service n'installe que `mlflow-skinny` (client de tracking). Le paquet `mlflow` complet, nécessaire à l'interface, est une dépendance de développement.
+À défaut, un score sous le seuil déclenche un avertissement dans les journaux et une étiquette qui rend les extractions dégradées filtrables en un clic.
